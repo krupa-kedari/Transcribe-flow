@@ -1,3 +1,1370 @@
+# # Imports and standard libraries
+# import os
+# import uuid
+# import mimetypes
+# import asyncio
+# import logging
+# import pathlib
+# import json
+# from datetime import datetime, timedelta
+# from contextlib import asynccontextmanager
+# from typing import Optional, List
+# from io import BytesIO
+
+# # FastAPI and related imports
+# from fastapi import (
+#     FastAPI,
+#     UploadFile,
+#     File,
+#     Form,
+#     HTTPException,
+#     WebSocket,
+#     WebSocketDisconnect,
+#     Request,
+#     Depends,
+#     BackgroundTasks,
+#     status
+# )
+# from fastapi.staticfiles import StaticFiles
+# from fastapi.responses import StreamingResponse, RedirectResponse, FileResponse, Response
+# from fastapi.concurrency import run_in_threadpool
+# from fastapi.middleware.cors import CORSMiddleware
+# from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+
+# # Backend application modules
+# from backend.models import get_pipeline
+# from backend.database import get_db
+# from backend import crud, schemas
+# from backend.dependencies import get_current_user
+# from backend.export import export_txt, export_pdf, export_docx, export_srt
+# from backend.security import (
+#     hash_password,
+#     verify_password,
+#     create_access_token,
+#     ACCESS_TOKEN_EXPIRE_MINUTES
+# )
+# from backend.schemas import UserCreate, UserLogin, Token, UpdateUsername, ChangePassword
+
+# # Create Database Tables on Startup
+# from backend.database import engine, Base
+# from backend import db_models
+
+# # Import R2 storage module
+# from backend.storage import upload_content, download_content, upload_audio, get_presigned_audio_url
+
+# from sqlalchemy.orm import Session
+# from pydantic import BaseModel
+
+# import os
+# os.environ["CUDA_VISIBLE_DEVICES"] = ""
+# os.environ["ORT_DISABLE_ALL_EPS_EXCEPT_DEF"] = "1"
+# os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# import warnings
+# warnings.filterwarnings("ignore", message="torchcodec is not installed correctly")
+# warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# # =====================================================
+# # Constants & Configuration
+# # =====================================================
+
+# # Common stop words to filter out during keyword extraction
+# STOP_WORDS = {
+#     'the', 'a', 'an', 'and', 'but', 'or', 'if', 'then', 'else', 'when',
+#     'at', 'from', 'by', 'on', 'off', 'for', 'in', 'out', 'over', 'to',
+#     'into', 'with', 'about', 'against', 'between', 'through', 'during',
+#     'before', 'after', 'above', 'below', 'up', 'down', 'under', 'again',
+#     'further', 'once', 'here', 'there', 'where', 'why', 'how', 'all',
+#     'any', 'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such',
+#     'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very',
+#     's', 't', 'can', 'will', 'just', 'don', 'should', 'now', 'd', 'll',
+#     'm', 'o', 're', 've', 'y', 'is', 'are', 'was', 'were', 'be', 'been',
+#     'being', 'have', 'has', 'had', 'do', 'does', 'did', 'but', 'at', 'by',
+#     'with', 'from', 'here', 'when', 'where', 'how', 'all', 'any', 'both',
+#     'each', 'few', 'more', 'some', 'such', 'no', 'nor', 'too', 'very',
+#     'can', 'will', 'just', 'should', 'now'
+# }
+
+# # Positive sentiment word list for sentiment analysis
+# POSITIVE_WORDS = {
+#     'good', 'great', 'awesome', 'excellent', 'happy', 'love', 'wonderful',
+#     'best', 'better', 'success', 'successful', 'win', 'winner', 'gain',
+#     'positive', 'benefit', 'beautiful', 'perfect', 'smart', 'intelligent',
+#     'easy', 'efficient', 'nice', 'cool', 'amazing', 'fantastic', 'joy',
+#     'fun', 'exciting', 'glad', 'proud', 'confident', 'optimistic', 'creative',
+#     'effective', 'productive', 'helpful', 'valuable', 'profitable', 'rewarding'
+# }
+
+# # Negative sentiment word list for sentiment analysis
+# NEGATIVE_WORDS = {
+#     'bad', 'terrible', 'awful', 'worst', 'worse', 'fail', 'failure',
+#     'lose', 'loser', 'loss', 'negative', 'problem', 'error', 'issue',
+#     'mistake', 'wrong', 'difficult', 'inefficient', 'sad', 'hate',
+#     'anger', 'angry', 'frustrated', 'annoyed', 'upset', 'disappointed',
+#     'boring', 'useless', 'waste', 'hurt', 'pain', 'danger', 'risk',
+#     'risky', 'concern', 'worried', 'stress', 'crisis', 'crash', 'broken'
+# }
+
+# def save_content_file(data: dict) -> str:
+#     """
+#     Save content data to Cloudflare R2 and return the R2 object key.
+#     This keeps large transcription data out of the database for better performance.
+#     """
+#     key = f"{uuid.uuid4()}.json"
+#     r2_key = upload_content(data, key)
+#     return r2_key
+
+# def read_content_file(r2_key: str) -> dict:
+#     """Download and parse content JSON from Cloudflare R2. Returns empty dict on failure."""
+#     if not r2_key:
+#         return {}
+#     return download_content(r2_key)
+
+# # =====================================================
+# # Content File Management
+# # =====================================================
+
+# # Request model for translation
+# class TranslateRequest(BaseModel):
+#     text: str
+#     source_lang: Optional[str] = "auto"
+#     target_lang: Optional[str] = "en"
+
+# # Request model for language detection
+# class DetectLanguageRequest(BaseModel):
+#     text: str
+
+# # Configure application logging
+# logging.basicConfig(level=logging.INFO)
+# logger = logging.getLogger(__name__)
+
+# # Store active websocket connections for real-time log streaming
+# active_connections: dict[str, WebSocket] = {}
+
+# # Queue used to send logs to websockets (async safe)
+# log_queue: asyncio.Queue = asyncio.Queue()
+
+# # Store main event loop reference for thread-safe log forwarding
+# main_loop: asyncio.AbstractEventLoop | None = None
+
+# # Custom logging handler that forwards logs to websockets
+# class WebSocketLogHandler(logging.Handler):
+#     """Custom log handler that pushes log messages to all connected WebSocket clients."""
+#     def emit(self, record):
+#         if record.levelno != logging.INFO or not main_loop:
+#             return
+#         try:
+#             msg = self.format(record)
+#             main_loop.call_soon_threadsafe(
+#                 log_queue.put_nowait,
+#                 (msg, record.levelname),
+#             )
+#         except Exception:
+#             pass
+
+# # Register websocket log handler
+# ws_handler = WebSocketLogHandler()
+# ws_handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+# logging.getLogger().addHandler(ws_handler)
+
+# # Background task that sends logs to all websocket clients
+# async def process_log_queue():
+#     """Background worker that broadcasts log messages to all connected WebSocket clients."""
+#     while True:
+#         msg, level = await log_queue.get()
+#         dead = []
+#         for rid, ws in active_connections.items():
+#             try:
+#                 await ws.send_json({
+#                     "type": "log",
+#                     "message": msg,
+#                     "level": level.lower(),
+#                     "timestamp": datetime.now().isoformat(),
+#                 })
+#             except Exception:
+#                 dead.append(rid)
+#         for rid in dead:
+#             active_connections.pop(rid, None)
+
+
+# # Create FastAPI app
+# app = FastAPI(
+#     title="TranscribeFlow",
+#     version="2.2",
+#     lifespan=lifespan,
+# )
+
+# FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
+# ALLOWED_ORIGINS = [FRONTEND_URL] if FRONTEND_URL != "*" else ["*"]
+
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=ALLOWED_ORIGINS,
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
+# # Resolve base directories
+# BASE_DIR = pathlib.Path(__file__).parent.parent.resolve()
+# UPLOAD_DIR = str(BASE_DIR / "uploads")
+# FRONTEND_DIR = str(BASE_DIR / "frontend")
+# STATIC_DIR = BASE_DIR / "frontend" / "static"
+
+# # File validation settings
+# ALLOWED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
+# MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB limit
+
+# def _init_db():
+#     """Run DB migrations — called lazily after startup."""
+#     Base.metadata.create_all(bind=engine)
+#     logger.info("✅ Database tables created/verified")
+#     insp = sa_inspect(engine)
+#     if "files" in insp.get_table_names():
+#         existing_cols = {c["name"] for c in insp.get_columns("files")}
+#         if "duration_seconds" not in existing_cols:
+#             with engine.begin() as conn:
+#                 conn.execute(sa_text("ALTER TABLE files ADD COLUMN duration_seconds FLOAT NULL"))
+#             logger.info("✅ Migrated: added duration_seconds column")
+#         else:
+#             logger.info("✅ duration_seconds column already exists")
+
+# @asynccontextmanager
+# async def lifespan(app: FastAPI):
+#     global main_loop
+#     main_loop = asyncio.get_running_loop()
+    
+#     # ← Move all DB setup here (runs AFTER port is bound)
+#     await run_in_threadpool(_init_db)
+    
+#     task = asyncio.create_task(process_log_queue())
+#     yield
+#     task.cancel()
+#     active_connections.clear()
+    
+# # Serve static assets (CSS, JS, images)
+# app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+# # WebSocket endpoint for live logs
+# @app.websocket("/ws/logs/{request_id}")
+# async def websocket_logs(ws: WebSocket, request_id: str):
+#     """
+#     WebSocket endpoint for real-time log streaming.
+#     Clients can connect with a request_id to receive processing logs.
+#     """
+#     await ws.accept()
+#     active_connections[request_id] = ws
+#     try:
+#         while True:
+#             await ws.receive_text()
+#     except WebSocketDisconnect:
+#         pass
+#     finally:
+#         active_connections.pop(request_id, None)
+
+# # =====================================================
+# # Authentication Routes
+# # =====================================================
+
+# @app.post("/api/auth/register", response_model=schemas.UserResponse, status_code=201)
+# async def register(user: UserCreate, db: Session = Depends(get_db)):
+#     """Register a new user"""
+    
+#     # Check if username already exists
+#     db_user = crud.get_user_by_username(db, user.username)
+#     if db_user:
+#         raise HTTPException(
+#             status_code=400,
+#             detail="Username already registered"
+#         )
+    
+#     # Check if email already exists
+#     db_user = crud.get_user_by_email(db, user.email)
+#     if db_user:
+#         raise HTTPException(
+#             status_code=400,
+#             detail="Email already registered"
+#         )
+    
+#     # Hash password
+#     hashed_password = hash_password(user.password)
+    
+#     # Create user
+#     new_user = crud.create_user(db, user, hashed_password)
+    
+#     logger.info(f"✅ New user registered: {user.username}")
+    
+#     return new_user
+
+# @app.post("/api/auth/login", response_model=Token)
+# async def login(user_credentials: UserLogin, db: Session = Depends(get_db)):
+#     """Login and get access token"""
+    
+#     # Authenticate user
+#     user = crud.authenticate_user(db, user_credentials.username, user_credentials.password)
+    
+#     if not user:
+#         raise HTTPException(
+#             status_code=status.HTTP_401_UNAUTHORIZED,
+#             detail="Incorrect username or password",
+#             headers={"WWW-Authenticate": "Bearer"},
+#         )
+    
+#     # Create access token
+#     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+#     access_token = create_access_token(
+#         data={"sub": user.id},
+#         expires_delta=access_token_expires
+#     )
+    
+#     logger.info(f"✅ User logged in: {user.username}")
+    
+#     return {
+#         "access_token": access_token,
+#         "token_type": "bearer"
+#     }
+
+# @app.get("/api/auth/me", response_model=schemas.UserResponse)
+# async def get_current_user_info(current_user = Depends(get_current_user)):
+#     """Get current logged-in user info"""
+#     return current_user
+
+# @app.post("/api/auth/logout")
+# async def logout():
+#     """Logout (client should delete token)"""
+#     return {"message": "Successfully logged out. Please delete your token."}
+
+# @app.put("/api/auth/update-username")
+# async def update_username(
+#     payload: UpdateUsername,
+#     db: Session = Depends(get_db),
+#     current_user = Depends(get_current_user)
+# ):
+#     """Update the current user's username"""
+#     new_username = payload.new_username.strip()
+
+#     # Validate length
+#     if len(new_username) < 3:
+#         raise HTTPException(400, "Username must be at least 3 characters")
+
+#     # Check uniqueness
+#     existing = crud.get_user_by_username(db, new_username)
+#     if existing and existing.id != current_user.id:
+#         raise HTTPException(400, "Username already taken")
+
+#     updated = crud.update_user_username(db, current_user.id, new_username)
+#     if not updated:
+#         raise HTTPException(404, "User not found")
+
+#     logger.info(f"✅ Username updated for user {current_user.id}")
+#     return {"message": "Username updated successfully", "username": updated.username}
+
+# @app.put("/api/auth/change-password")
+# async def change_password(
+#     payload: ChangePassword,
+#     db: Session = Depends(get_db),
+#     current_user = Depends(get_current_user)
+# ):
+#     """Change the current user's password"""
+#     # Verify current password
+#     if not verify_password(payload.current_password, current_user.hashed_password):
+#         raise HTTPException(400, "Current password is incorrect")
+
+#     # Validate new password length
+#     if len(payload.new_password) < 6:
+#         raise HTTPException(400, "New password must be at least 6 characters")
+
+#     # Hash and save
+#     new_hash = hash_password(payload.new_password)
+#     updated = crud.update_user_password(db, current_user.id, new_hash)
+#     if not updated:
+#         raise HTTPException(404, "User not found")
+
+#     logger.info(f"✅ Password changed for user {current_user.id}")
+#     return {"message": "Password changed successfully"}
+
+# # =====================================================
+# # File Upload & Processing
+# # =====================================================
+
+# @app.post("/api/upload")
+# async def upload_audio(
+#     file: UploadFile = File(...),
+#     language: str = Form("auto"),
+#     summary_mode: str = Form("bullet"),
+#     enable_diarization: str = Form("false"),
+#     num_speakers: Optional[int] = Form(None),
+#     db: Session = Depends(get_db),
+#     current_user = Depends(get_current_user),
+# ):
+#     """
+#     Upload and process audio file synchronously.
+#     Handles file validation, transcription, optional speaker diarization, and summarization.
+#     Returns processed content immediately.
+#     """
+#     ext = os.path.splitext(file.filename)[1].lower()
+#     if ext not in ALLOWED_EXTENSIONS:
+#         raise HTTPException(400, "Unsupported file type")
+
+#     content = await file.read()
+#     if len(content) > MAX_FILE_SIZE:
+#         raise HTTPException(413, "File too large")
+
+#     safe_name = f"{uuid.uuid4().hex[:8]}_{file.filename}"
+
+#     # Upload audio to Cloudflare R2
+#     upload_audio(content, safe_name)
+
+#     # Write to /tmp for AI pipeline processing
+#     import tempfile
+#     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1])
+#     tmp.write(content)
+#     tmp.flush()
+#     tmp.close()
+#     path = tmp.name
+
+#     # Parse diarization flag from string
+#     diarization_enabled = enable_diarization.lower() in ('true', '1', 'yes', 'on')
+#     logger.info(f"🔧 Diarization enabled: {diarization_enabled} (raw value: '{enable_diarization}')")
+
+#     # Transcribe
+#     transcript_result = await run_in_threadpool(get_pipeline().transcribe, path, language)
+#     transcript_text = transcript_result["text"]
+#     word_timestamps = transcript_result["words"]
+#     transcript_segments = transcript_result.get("segments", [])
+    
+#     logger.info(f"📊 Transcription data: {len(word_timestamps)} words, {len(transcript_segments)} segments, {len(transcript_text)} chars")
+    
+#     # Speaker diarization (optional)
+#     speaker_segments = []
+#     formatted_transcript = transcript_text  # Default to plain transcript
+    
+#     if diarization_enabled:
+#         try:
+#             logger.info("🎤 Running speaker diarization...")
+#             logger.info(f"📂 Audio file: {path}")
+#             logger.info(f"👥 Expected speakers: {num_speakers if num_speakers else 'Auto-detect'}")
+            
+#             # Run diarization and wait for completion
+#             speaker_segments = await run_in_threadpool(
+#                 get_pipeline().diarize_speakers,
+#                 path,
+#                 num_speakers
+#             )
+            
+#             # Log what we got back
+#             logger.info(f"🔍 Diarization returned {len(speaker_segments) if speaker_segments else 0} segments")
+            
+#             # Merge diarization with transcript
+#             if speaker_segments and len(speaker_segments) > 0:
+#                 # Count unique speakers
+#                 unique_speakers = len(set([s['speaker'] for s in speaker_segments]))
+#                 logger.info(f"👤 Found {unique_speakers} unique speakers")
+                
+#                 # Merge with all available transcript data
+#                 speaker_transcript = get_pipeline().merge_diarization_with_transcript(
+#                     word_timestamps,
+#                     speaker_segments,
+#                     transcript_segments=transcript_segments,
+#                     full_text=transcript_text
+#                 )
+                
+#                 logger.info(f"📝 Created {len(speaker_transcript)} speaker turns")
+                
+#                 # Format for display
+#                 formatted_transcript = get_pipeline().format_transcript_with_speakers(speaker_transcript)
+                
+#                 logger.info(f"✅ Diarization complete! Transcript formatted with {unique_speakers} speakers")
+#             else:
+#                 logger.warning("⚠️ No speaker segments returned from diarization")
+#                 logger.warning("⚠️ Using original transcript without speaker labels")
+            
+#         except Exception as e:
+#             logger.error(f"❌ Diarization failed: {e}")
+#             import traceback
+#             logger.error(traceback.format_exc())
+#             logger.warning("⚠️ Continuing with original transcript")
+    
+#     # Summarize (use the formatted transcript if diarization was used)
+#     summary = await run_in_threadpool(get_pipeline().summarize, formatted_transcript, summary_mode)
+    
+#     # Create content file data
+#     content_data = {
+#         "transcript": formatted_transcript,
+#         "summary": summary,
+#         "word_timestamps": word_timestamps,
+#         "speaker_segments": speaker_segments,
+#     }
+    
+#     # Clean up temp file from /tmp
+#     try:
+#         if os.path.exists(path):
+#             os.remove(path)
+#     except Exception:
+#         pass
+
+#     # Save metadata to database
+#     db_file = crud.create_file(
+#         db,
+#         schemas.FileCreate(
+#             user_id=current_user.id,
+#             filename=file.filename,
+#             saved_as=f"audio/{safe_name}",
+#             file_size_mb=round(len(content) / (1024 * 1024), 2),
+#             language=language,
+#             content_file=content_filename,
+#             audio_url=f"/api/stream/{safe_name}",
+#         ),
+#     )
+
+#     return {
+#         "id": db_file.id,
+#         "filename": file.filename,
+#         "file_size": len(content),  # ✅ Add file size in bytes
+#         "size": len(content),  # ✅ Add alias
+#         "file_size_mb": db_file.file_size_mb,  # ✅ Keep MB version
+#         "audio_url": db_file.audio_url,
+#         "transcript": formatted_transcript,  # Return from memory since we just created it
+#         "summary": summary,
+#         "language": language,  # ✅ Add language
+#         "created_at": db_file.created_at.isoformat(),  # ✅ Add timestamp
+#         "status": "success",
+#     }
+
+# @app.post("/api/upload/batch")
+# async def batch_upload_audio(
+#     files: List[UploadFile] = File(...),
+#     language: str = Form("auto"),
+#     summary_mode: str = Form("bullet"),
+#     enable_diarization: str = Form("false"),
+#     num_speakers: Optional[int] = Form(None),
+#     background_tasks: BackgroundTasks = None,
+#     db: Session = Depends(get_db),
+#     current_user = Depends(get_current_user)
+# ):
+#     """
+#     Upload multiple files and process them in background.
+#     Returns immediately with batch ID while processing continues asynchronously.
+#     """
+    
+#     if len(files) > 10:
+#         raise HTTPException(400, "Maximum 10 files per batch")
+    
+#     batch_id = str(uuid.uuid4())
+#     results = []
+    
+#     for idx, file in enumerate(files):
+#         request_id = f"{batch_id}_{idx}"
+#         logger.info(f"📤 Batch upload {idx+1}/{len(files)}: {file.filename}")
+        
+#         # Validate file
+#         ext = os.path.splitext(file.filename)[1].lower()
+#         if ext not in ALLOWED_EXTENSIONS:
+#             results.append({
+#                 "filename": file.filename,
+#                 "status": "error",
+#                 "error": "Unsupported file format"
+#             })
+#             continue
+        
+#         content = await file.read()
+#         if len(content) > MAX_FILE_SIZE:
+#             results.append({
+#                 "filename": file.filename,
+#                 "status": "error",
+#                 "error": "File too large"
+#             })
+#             continue
+        
+#         safe_name = f"{uuid.uuid4().hex[:8]}_{file.filename}"
+
+#         # Upload audio to Cloudflare R2
+#         upload_audio(content, safe_name)
+
+#         # Write to /tmp for background processing
+#         import tempfile
+#         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1])
+#         tmp.write(content)
+#         tmp.flush()
+#         tmp.close()
+#         save_path = tmp.name
+        
+#         # Parse diarization flag from string
+#         diarization_enabled = enable_diarization.lower() in ('true', '1', 'yes', 'on') if isinstance(enable_diarization, str) else bool(enable_diarization)
+        
+#         # Process in background
+#         background_tasks.add_task(
+#             process_audio_file,
+#             save_path,
+#             safe_name,
+#             file.filename,
+#             language,
+#             summary_mode,
+#             current_user.id,
+#             len(content),
+#             diarization_enabled,
+#             num_speakers
+#         )
+        
+#         results.append({
+#             "filename": file.filename,
+#             "status": "processing",
+#             "request_id": request_id
+#         })
+    
+#     return {
+#         "batch_id": batch_id,
+#         "total_files": len(files),
+#         "results": results
+#     }
+
+# # Background processing function
+# def process_audio_file(
+#     save_path: str,
+#     safe_name: str,
+#     filename: str,
+#     language: str,
+#     summary_mode: str,
+#     user_id: str,
+#     file_size: int,
+#     enable_diarization = False,
+#     num_speakers: Optional[int] = None
+# ):
+#     """
+#     Background task to process audio file.
+#     Runs transcription, optional diarization, and summarization.
+#     Saves results to content file and metadata to database.
+#     """
+#     from backend.database import SessionLocal
+    
+#     # Ensure enable_diarization is a boolean
+#     if isinstance(enable_diarization, str):
+#         enable_diarization = enable_diarization.lower() in ('true', '1', 'yes', 'on')
+    
+#     db = SessionLocal()
+#     try:
+#         logger.info(f"🎙️ Processing {filename}...")
+        
+#         # Transcribe
+#         transcript_result = get_pipeline().transcribe(save_path, language)
+#         transcript_text = transcript_result["text"]
+#         word_timestamps = transcript_result["words"]
+#         transcript_segments = transcript_result.get("segments", [])
+        
+#         # Speaker diarization (optional)
+#         speaker_segments = []
+#         formatted_transcript = transcript_text
+        
+#         if enable_diarization:
+#             try:
+#                 speaker_segments = get_pipeline().diarize_speakers(save_path, num_speakers)
+                
+#                 if speaker_segments:
+#                     speaker_transcript = get_pipeline().merge_diarization_with_transcript(
+#                         word_timestamps,
+#                         speaker_segments,
+#                         transcript_segments=transcript_segments,
+#                         full_text=transcript_text
+#                     )
+#                     formatted_transcript = get_pipeline().format_transcript_with_speakers(speaker_transcript)
+                    
+#             except Exception as e:
+#                 logger.warning(f"⚠️ Diarization failed for {filename}: {e}")
+        
+#         # Summarize
+#         summary = get_pipeline().summarize(formatted_transcript, summary_mode)
+        
+#         # Save to file (NOT DB)
+#         content_data = {
+#             "transcript": formatted_transcript,
+#             "summary": summary,
+#             "word_timestamps": word_timestamps,
+#             "speaker_segments": speaker_segments,
+#         }
+#         content_filename = save_content_file(content_data)
+        
+#         # Calculate audio duration from transcript segments
+#         duration_seconds = None
+#         if transcript_segments:
+#             duration_seconds = max(seg.get("end", 0) for seg in transcript_segments)
+#         elif word_timestamps:
+#             duration_seconds = max(w.get("end", 0) for w in word_timestamps)
+        
+#         # Save to DB
+#         file_create = schemas.FileCreate(
+#             user_id=user_id,
+#             filename=filename,
+#             saved_as=f"audio/{safe_name}",
+#             file_size_mb=round(file_size / (1024 * 1024), 2),
+#             language=language,
+#             content_file=content_filename,
+#             audio_url=f"/api/stream/{safe_name}",
+#             duration_seconds=duration_seconds,
+#         )
+        
+#         db_file = crud.create_file(db, file_create)
+#         logger.info(f"✅ Completed: {filename}")
+    
+#     except Exception as e:
+#         logger.error(f"❌ Failed {filename}: {e}")
+
+#     finally:
+#         db.close()
+#         # Clean up temp file from /tmp
+#         try:
+#             if os.path.exists(save_path):
+#                 os.remove(save_path)
+#         except Exception:
+#             pass
+
+# # =====================================================
+# # Audio Streaming
+# # =====================================================
+
+# @app.get("/api/stream/{filename}")
+# async def stream_audio(filename: str, request: Request):
+#     """
+#     Generate a presigned Cloudflare R2 URL and redirect the client to it.
+#     Audio is served directly from Cloudflare CDN - no bandwidth through Render.
+#     """
+#     from backend.storage import get_presigned_audio_url
+#     r2_key = f"audio/{filename}"
+#     url = get_presigned_audio_url(r2_key, expires_in=3600)
+#     if not url:
+#         raise HTTPException(404, "File not found or storage error")
+#     return RedirectResponse(url=url, status_code=302)
+
+# # =====================================================
+# # Translation & Language Detection
+# # =====================================================
+
+# @app.post("/api/detect-language")
+# async def detect_language(req: DetectLanguageRequest):
+#     """Detect language of text"""
+#     lang = await run_in_threadpool(get_pipeline().detect_language, req.text)
+#     return {"language": lang}
+
+# @app.post("/api/translate")
+# async def translate_text(req: TranslateRequest):
+#     """Translate text between languages"""
+#     result = await run_in_threadpool(
+#         get_pipeline().translate_text,
+#         req.text,
+#         req.source_lang,
+#         req.target_lang,
+#     )
+#     return {"status": "success", **result}
+
+# # =====================================================
+# # File Management
+# # =====================================================
+
+# @app.get("/api/files")
+# async def get_user_files(
+#     skip: int = 0,
+#     limit: int = 100,
+#     search: Optional[str] = None,
+#     include_content: bool = True,
+#     db: Session = Depends(get_db),
+#     current_user = Depends(get_current_user)
+# ):
+#     """
+#     Get all files for the current user with pinned files first.
+#     Supports pagination, search, and optional content loading for performance.
+#     """
+#     query = db.query(db_models.File).filter(
+#         db_models.File.user_id == current_user.id,
+#         db_models.File.is_deleted == False
+#     )
+    
+#     if search:
+#         query = query.filter(
+#             db_models.File.filename.contains(search)
+#         )
+    
+#     # Sort by pinned first, then by created date
+#     files = query.order_by(
+#         db_models.File.is_pinned.desc(),
+#         db_models.File.created_at.desc()
+#     ).offset(skip).limit(limit).all()
+    
+#     total = crud.get_user_file_count(db, current_user.id)
+    
+#     # Process files - optimize by skipping content read if not requested
+#     result_files = []
+    
+#     if include_content:
+#         # If including content, read synchronously or defer (simple loop here)
+#         for f in files:
+#             c_data = read_content_file(f.content_file) if f.content_file else {}
+#             result_files.append({
+#                 "id": f.id,
+#                 "filename": f.filename,
+#                 "file_size": int(f.file_size_mb * 1024 * 1024) if f.file_size_mb else 0,
+#                 "size": int(f.file_size_mb * 1024 * 1024) if f.file_size_mb else 0,
+#                 "file_size_mb": f.file_size_mb,
+#                 "size_mb": f.file_size_mb,
+#                 "language": f.language,
+#                 "created_at": f.created_at.isoformat(),
+#                 "audio_url": f.audio_url,
+#                 "is_starred": f.is_starred,
+#                 "is_pinned": f.is_pinned,
+#                 "content_file": f.content_file,
+#                 "transcript": c_data.get("transcript"),
+#                 "summary": c_data.get("summary")
+#             })
+#     else:
+#         # Faster path without file I/O
+#         for f in files:
+#             result_files.append({
+#                 "id": f.id,
+#                 "filename": f.filename,
+#                 "file_size": int(f.file_size_mb * 1024 * 1024) if f.file_size_mb else 0,
+#                 "size": int(f.file_size_mb * 1024 * 1024) if f.file_size_mb else 0,
+#                 "file_size_mb": f.file_size_mb,
+#                 "size_mb": f.file_size_mb,
+#                 "language": f.language,
+#                 "created_at": f.created_at.isoformat(),
+#                 "audio_url": f.audio_url,
+#                 "is_starred": f.is_starred,
+#                 "is_pinned": f.is_pinned,
+#                 "content_file": f.content_file,
+#                 "transcript": None,
+#                 "summary": None
+#             })
+    
+#     return {
+#         "files": result_files,
+#         "total": total,
+#         "skip": skip,
+#         "limit": limit
+#     }
+
+# @app.get("/api/files/starred")
+# async def get_starred_files(
+#     db: Session = Depends(get_db),
+#     current_user = Depends(get_current_user)
+# ):
+#     """Get all starred files"""
+#     files = crud.get_starred_files(db, current_user.id)
+    
+#     return {
+#         "files": [
+#             {
+#                 "id": f.id,
+#                 "filename": f.filename,
+#                 "is_starred": f.is_starred,
+#                 "is_pinned": f.is_pinned,
+#                 "created_at": f.created_at.isoformat()
+#             }
+#             for f in files
+#         ]
+#     }
+
+# @app.get("/api/files/{file_id}")
+# async def get_file(
+#     file_id: str,
+#     db: Session = Depends(get_db),
+#     current_user = Depends(get_current_user)
+# ):
+#     """Get a single file by ID with all associated content"""
+#     file = crud.get_file_by_id(db, file_id, current_user.id)
+    
+#     if not file:
+#         raise HTTPException(404, "File not found")
+    
+#     # Calculate file size in bytes from MB
+#     file_size_bytes = int(file.file_size_mb * 1024 * 1024) if file.file_size_mb else 0
+    
+#     # Read content from file
+#     transcript = None
+#     summary = None
+#     word_timestamps = None
+#     speaker_segments = None
+    
+#     if file.content_file:
+#         content = read_content_file(file.content_file)
+#         transcript = content.get("transcript")
+#         summary = content.get("summary")
+#         word_timestamps = json.dumps(content.get("word_timestamps")) if content.get("word_timestamps") else None
+#         speaker_segments = json.dumps(content.get("speaker_segments")) if content.get("speaker_segments") else None
+    
+#     return {
+#         "id": file.id,
+#         "filename": file.filename,
+#         "file_size": file_size_bytes,
+#         "size": file_size_bytes,
+#         "file_size_mb": file.file_size_mb,
+#         "size_mb": file.file_size_mb,
+#         "language": file.language,
+#         "created_at": file.created_at.isoformat(),
+#         "audio_url": file.audio_url,
+#         "transcript": transcript,
+#         "summary": summary,
+#         "is_starred": file.is_starred,
+#         "is_pinned": file.is_pinned,
+#         "word_timestamps": word_timestamps,
+#         "speaker_segments": speaker_segments,
+#         "content_file": file.content_file
+#     }
+
+# @app.delete("/api/files/{file_id}")
+# async def delete_file(
+#     file_id: str,
+#     db: Session = Depends(get_db),
+#     current_user = Depends(get_current_user)
+# ):
+#     """Delete a file (soft delete)"""
+#     success = crud.delete_file(db, file_id, current_user.id)
+    
+#     if not success:
+#         raise HTTPException(404, "File not found")
+    
+#     return {"message": "File deleted successfully"}
+
+# @app.patch("/api/files/{file_id}/star")
+# async def star_file(
+#     file_id: str,
+#     request: Request,
+#     db: Session = Depends(get_db),
+#     current_user = Depends(get_current_user)
+# ):
+#     """Star/unstar a file"""
+#     body = await request.json()
+#     starred = body.get('starred', False)
+    
+#     success = crud.star_file(db, file_id, current_user.id, starred)
+    
+#     if not success:
+#         raise HTTPException(404, "File not found")
+    
+#     return {"message": "File starred" if starred else "File unstarred"}
+
+# @app.patch("/api/files/{file_id}/pin")
+# async def pin_file(
+#     file_id: str,
+#     request: Request,
+#     db: Session = Depends(get_db),
+#     current_user = Depends(get_current_user)
+# ):
+#     """Pin/unpin a file"""
+#     body = await request.json()
+#     pinned = body.get('pinned', False)
+    
+#     success = crud.pin_file(db, file_id, current_user.id, pinned)
+    
+#     if not success:
+#         raise HTTPException(404, "File not found")
+    
+#     return {"message": "File pinned" if pinned else "File unpinned"}
+
+# # =====================================================
+# # Export
+# # =====================================================
+
+# @app.get("/api/files/{file_id}/export")
+# async def export_file(
+#     file_id: str,
+#     format: str,  # txt, pdf, docx, or srt
+#     content: str = "both",  # transcript, summary, or both
+#     db: Session = Depends(get_db),
+#     current_user = Depends(get_current_user)
+# ):
+#     """
+#     Export transcript in various formats.
+#     Supports TXT, PDF, DOCX, and SRT with options to export transcript, summary, or both.
+#     """
+#     file = crud.get_file_by_id(db, file_id, current_user.id)
+    
+#     if not file:
+#         raise HTTPException(404, "File not found")
+    
+#     format = format.lower()
+#     content = content.lower()
+    
+#     # Determine what text to export based on content param
+#     # Load content from file
+#     transcript_text = ""
+#     summary_text = ""
+#     word_timestamps_data = None
+    
+#     if file.content_file:
+#         content_data = read_content_file(file.content_file)
+#         transcript_text = content_data.get("transcript") or ""
+#         summary_text = content_data.get("summary") or ""
+#         word_timestamps_data = content_data.get("word_timestamps") # List or None
+
+#     if content == "transcript":
+#         # transcript_text already populated
+#         summary_text = ""
+#     elif content == "summary":
+#         transcript_text = ""
+#         # summary_text already populated
+#     else:  # both
+#         # both already populated
+#         pass
+    
+#     if format == "txt":
+#         export_content = export_txt(transcript_text, summary_text, file.filename, content)
+#         media_type = "text/plain"
+#         extension = "txt"
+#     elif format == "pdf":
+#         export_content = export_pdf(transcript_text, summary_text, file.filename, content)
+#         media_type = "application/pdf"
+#         extension = "pdf"
+#     elif format == "docx":
+#         export_content = export_docx(transcript_text, summary_text, file.filename, content)
+#         media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+#         extension = "docx"
+#     elif format == "srt":
+#         # Prepare word_timestamps as JSON string/list for export_srt
+#         wt_input = json.dumps(word_timestamps_data) if word_timestamps_data else "[]"
+#         export_content = export_srt(wt_input, transcript_text)
+#         media_type = "application/x-subrip"
+#         extension = "srt"
+#     else:
+#         raise HTTPException(400, "Invalid format. Use: txt, pdf, docx, or srt")
+    
+#     filename = f"{file.filename.rsplit('.', 1)[0]}.{extension}"
+    
+#     return StreamingResponse(
+#         BytesIO(export_content),
+#         media_type=media_type,
+#         headers={"Content-Disposition": f"attachment; filename={filename}"}
+#     )
+
+# # =====================================================
+# # Health Check
+# # =====================================================
+
+# @app.get("/api/health")
+# async def health():
+#     """Health check endpoint"""
+#     return {"status": "ok", "version": "2.2"}
+
+# # =====================================================
+# # Dashboard Stats
+# # =====================================================
+
+# # Stop words to exclude from keyword extraction
+# STOP_WORDS = {
+#     'the','a','an','and','or','but','in','on','at','to','for','of','with',
+#     'by','from','is','it','this','that','was','are','were','be','been',
+#     'being','have','has','had','do','does','did','will','would','could',
+#     'should','may','might','can','shall','not','no','so','if','then',
+#     'than','too','very','just','about','above','after','again','all',
+#     'also','am','any','because','before','between','both','each','few',
+#     'get','got','here','how','into','its','let','like','make','many',
+#     'me','more','most','much','my','new','now','only','other','our',
+#     'out','over','own','same','she','some','such','take','their','them',
+#     'there','these','they','those','through','under','up','us','we',
+#     'what','when','where','which','while','who','why','you','your',
+#     'i','he','her','him','his','able','said','one','two','well','know',
+#     'say','go','see','come','thing','think','look','want','give','use',
+#     'find','tell','ask','work','seem','feel','try','leave','call','need',
+#     'become','keep','put','mean','still','back','turn','long','right',
+#     'going','really','even','way','good','yeah','okay','yes','um','uh',
+#     'oh','ah','speaker','would','going','actually','something','people',
+#     'time','first','last','next','much','little'
+# }
+
+# POSITIVE_WORDS = {
+#     'good','great','excellent','amazing','wonderful','fantastic','happy',
+#     'love','best','better','positive','success','successful','benefit',
+#     'improve','progress','achieve','win','growth','opportunity','agree',
+#     'pleased','outstanding','brilliant','perfect','nice','awesome',
+#     'thanks','thank','appreciate','well','exciting','excited','glad',
+#     'enjoy','helpful','productive','efficient','effective','solved',
+# }
+
+# NEGATIVE_WORDS = {
+#     'bad','poor','terrible','awful','horrible','wrong','fail','failure',
+#     'problem','issue','error','negative','worse','worst','difficult',
+#     'trouble','risk','concern','worried','unfortunately','disagree',
+#     'unhappy','disappoint','frustrated','frustrating','delay','delayed',
+#     'lost','miss','missed','broken','stuck','confusing','confused',
+#     'lack','lacking','unable','cannot','complaint','slow','expensive',
+# }
+
+# @app.get("/api/dashboard/stats")
+# def get_dashboard_stats(
+#     db: Session = Depends(get_db),
+#     current_user = Depends(get_current_user)
+# ):
+#     """
+#     Get dashboard statistics for the current user.
+#     Calculates usage metrics, trends, common keywords, sentiment analysis,
+#     and productivity score based on transcription activity.
+#     """
+#     from sqlalchemy import func as sqlfunc
+#     from collections import Counter
+#     import re
+
+#     user_id = current_user.id
+
+#     try:
+#         # ── Base query: all non-deleted files for this user ──────────
+#         base = db.query(db_models.File).filter(
+#             db_models.File.user_id == user_id,
+#             db_models.File.is_deleted == False
+#         )
+
+#         all_files = base.all()
+#         total_files = len(all_files)
+
+#         if total_files == 0:
+#             return {
+#                 "total_files": 0,
+#                 "total_minutes": 0,
+#                 "avg_duration_min": 0,
+#                 "most_used_language": "—",
+#                 "total_storage_mb": 0,
+#                 "weekly_files": 0,
+#                 "weekly_minutes": 0,
+#                 "files_trend_pct": 0,
+#                 "minutes_trend_pct": 0,
+#                 "quota_pct": 0,
+#                 "common_keywords": [],
+#                 "sentiment": {"positive": 0, "neutral": 0, "negative": 0},
+#                 "productivity_score": 0,
+#             }
+
+#         # ── Backfill duration_seconds for files that don't have it ────
+#         for f in all_files:
+#             if f.duration_seconds is None and f.content_file:
+#                 try:
+#                     c_data = read_content_file(f.content_file)
+#                     segments = c_data.get("word_timestamps") or []
+#                     if segments:
+#                         max_end = max(seg.get("end", 0) for seg in segments)
+#                         if max_end > 0:
+#                             f.duration_seconds = max_end
+#                             db.add(f)
+#                 except Exception:
+#                     pass
+#         try:
+#             db.commit()
+#         except Exception:
+#             db.rollback()
+
+#         # ── Basic aggregates ─────────────────────────────────────────
+#         total_storage_mb = sum(f.file_size_mb or 0 for f in all_files)
+
+#         total_seconds = sum(
+#             f.duration_seconds if f.duration_seconds else (f.file_size_mb or 0) * 60
+#             for f in all_files
+#         )
+#         total_minutes = round(total_seconds / 60, 1)
+#         avg_duration_min = round(total_minutes / total_files, 1) if total_files else 0
+
+#         lang_counts = Counter(f.language for f in all_files if f.language)
+#         most_used_language = lang_counts.most_common(1)[0][0] if lang_counts else "—"
+
+#         # ── Weekly stats (last 7 days vs prior 7 days) ───────────────
+#         now = datetime.utcnow()
+#         week_ago = now - timedelta(days=7)
+#         two_weeks_ago = now - timedelta(days=14)
+
+#         this_week = []
+#         for f in all_files:
+#             try:
+#                 if f.created_at:
+#                     ca = f.created_at.replace(tzinfo=None) if f.created_at.tzinfo else f.created_at
+#                     if ca >= week_ago:
+#                         this_week.append(f)
+#             except Exception:
+#                 pass
+            
+#             last_week = [f for f in all_files if f.created_at and two_weeks_ago <= f.created_at.replace(tzinfo=None) < week_ago]
+
+#         weekly_files = len(this_week)
+#         weekly_seconds = sum(
+#             f.duration_seconds if f.duration_seconds else (f.file_size_mb or 0) * 60
+#             for f in this_week
+#         )
+#         weekly_minutes = round(weekly_seconds / 60, 1)
+
+#         last_week_files = len(last_week)
+#         last_week_seconds = sum(
+#             f.duration_seconds if f.duration_seconds else (f.file_size_mb or 0) * 60
+#             for f in last_week
+#         )
+
+#         files_trend_pct = 0
+#         if last_week_files > 0:
+#             files_trend_pct = round(((weekly_files - last_week_files) / last_week_files) * 100)
+#         elif weekly_files > 0:
+#             files_trend_pct = 100
+
+#         minutes_trend_pct = 0
+#         if last_week_seconds > 0:
+#             minutes_trend_pct = round(((weekly_seconds - last_week_seconds) / last_week_seconds) * 100)
+#         elif weekly_seconds > 0:
+#             minutes_trend_pct = 100
+
+#         quota_pct = min(round((weekly_files / max(total_files, 1)) * 100), 100)
+
+#         # ── Common keywords from recent transcripts ──────────────────
+#         recent_files = sorted(all_files, key=lambda f: f.created_at or datetime.min, reverse=True)[:20]
+#         word_counter = Counter()
+#         for f in recent_files:
+#             f_transcript = None
+#             if f.content_file:
+#                 try:
+#                     c_data = read_content_file(f.content_file)
+#                     f_transcript = c_data.get("transcript")
+#                 except Exception:
+#                     pass
+#             if f_transcript:
+#                 words = re.findall(r'[a-zA-Z]{3,}', f_transcript.lower())
+#                 word_counter.update(w for w in words if w not in STOP_WORDS)
+
+#         common_keywords = [word.title() for word, _ in word_counter.most_common(8)]
+
+#         # ── Sentiment heuristic ──────────────────────────────────────
+#         pos_count = 0
+#         neg_count = 0
+#         total_sentiment_words = 0
+#         for f in recent_files:
+#             f_transcript = None
+#             if f.content_file:
+#                 try:
+#                     c_data = read_content_file(f.content_file)
+#                     f_transcript = c_data.get("transcript")
+#                 except Exception:
+#                     pass
+#             if f_transcript:
+#                 words = re.findall(r'[a-zA-Z]{3,}', f_transcript.lower())
+#                 for w in words:
+#                     if w in POSITIVE_WORDS:
+#                         pos_count += 1
+#                         total_sentiment_words += 1
+#                     elif w in NEGATIVE_WORDS:
+#                         neg_count += 1
+#                         total_sentiment_words += 1
+
+#         if total_sentiment_words > 0:
+#             pos_pct = round((pos_count / total_sentiment_words) * 100)
+#             neg_pct = round((neg_count / total_sentiment_words) * 100)
+#             neu_pct = 100 - pos_pct - neg_pct
+#         else:
+#             pos_pct, neu_pct, neg_pct = 0, 0, 0
+
+#         # ── Productivity score (60/40 weighted average) ──────────────
+#         WEEKLY_FILE_TARGET = 10   # target files per week
+#         WEEKLY_DAY_TARGET  = 7    # target active days per week
+
+#         active_days = set()
+#         for f in this_week:
+#             if f.created_at:
+#                 active_days.add(f.created_at.replace(tzinfo=None).date())
+
+#         file_score = min((weekly_files / WEEKLY_FILE_TARGET) * 100, 100)   # 60% weight
+#         day_score  = min((len(active_days) / WEEKLY_DAY_TARGET) * 100, 100) # 40% weight
+
+#         productivity_score = round(0.6 * file_score + 0.4 * day_score)
+
+#         return {
+#             "total_files": total_files,
+#             "total_minutes": total_minutes,
+#             "avg_duration_min": avg_duration_min,
+#             "most_used_language": most_used_language.upper(),
+#             "total_storage_mb": round(total_storage_mb, 1),
+#             "weekly_files": weekly_files,
+#             "weekly_minutes": weekly_minutes,
+#             "files_trend_pct": files_trend_pct,
+#             "minutes_trend_pct": minutes_trend_pct,
+#             "quota_pct": quota_pct,
+#             "common_keywords": common_keywords,
+#             "sentiment": {
+#                 "positive": pos_pct,
+#                 "neutral": neu_pct,
+#                 "negative": neg_pct,
+#             },
+#             "productivity_score": productivity_score,
+#         }
+
+#     except Exception as e:
+#         logger.error(f"❌ Dashboard stats error: {e}", exc_info=True)
+#         return {
+#             "total_files": 0,
+#             "total_minutes": 0,
+#             "avg_duration_min": 0,
+#             "most_used_language": "—",
+#             "total_storage_mb": 0,
+#             "weekly_files": 0,
+#             "weekly_minutes": 0,
+#             "files_trend_pct": 0,
+#             "minutes_trend_pct": 0,
+#             "quota_pct": 0,
+#             "common_keywords": [],
+#             "sentiment": {"positive": 34, "neutral": 33, "negative": 33},
+#             "productivity_score": 0,
+#         }
+
+
+# @app.get("/favicon.ico", include_in_schema=False)
+# async def favicon():
+#     path = "static/favicon.ico"
+#     if os.path.exists(path):
+#         return FileResponse(path)
+#     return Response(status_code=204)
+
+# # =====================================================
+# # Frontend Routes (No Auth Check)
+# # =====================================================
+
+# @app.get("/")
+# async def serve_index():
+#     """Serve landing page"""
+#     file_path = os.path.join(FRONTEND_DIR, "index.html")
+#     return FileResponse(file_path)
+
+# @app.get("/login")
+# async def serve_login():
+#     """Serve login page"""
+#     file_path = os.path.join(FRONTEND_DIR, "login.html")
+#     return FileResponse(file_path)
+
+# @app.get("/register")
+# async def serve_register():
+#     """Serve registration page"""
+#     file_path = os.path.join(FRONTEND_DIR, "register.html")
+#     return FileResponse(file_path)
+
+# @app.get("/upload")
+# async def serve_upload():
+#     """Serve upload page"""
+#     file_path = os.path.join(FRONTEND_DIR, "upload.html")
+#     return FileResponse(file_path)
+
+# @app.get("/dashboard")
+# async def serve_dashboard():
+#     """Serve dashboard page"""
+#     file_path = os.path.join(FRONTEND_DIR, "dashboard.html")
+#     return FileResponse(file_path)
+
+# @app.get("/results")
+# async def serve_results():
+#     """Serve results page"""
+#     file_path = os.path.join(FRONTEND_DIR, "results.html")
+#     return FileResponse(file_path)
+
+# @app.get("/history")
+# async def serve_history():
+#     """Serve history (file manager) page"""
+#     file_path = os.path.join(FRONTEND_DIR, "history.html")
+#     return FileResponse(file_path)
+
+# @app.get("/user")
+# async def serve_user():
+#     """Serve user profile page"""
+#     file_path = os.path.join(FRONTEND_DIR, "user.html")
+#     return FileResponse(file_path)
+
+
+
+
 # Imports and standard libraries
 import os
 import uuid
@@ -6,12 +1373,22 @@ import asyncio
 import logging
 import pathlib
 import json
+import warnings
+import tempfile
 from datetime import datetime, timedelta
 from contextlib import asynccontextmanager
 from typing import Optional, List
 from io import BytesIO
 
-# FastAPI and related imports
+# Environment configuration
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["ORT_DISABLE_ALL_EPS_EXCEPT_DEF"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+warnings.filterwarnings("ignore", message="torchcodec is not installed correctly")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# FastAPI imports
 from fastapi import (
     FastAPI,
     UploadFile,
@@ -26,12 +1403,16 @@ from fastapi import (
     status
 )
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse, RedirectResponse, FileResponse, Response
+from fastapi.responses import (
+    StreamingResponse,
+    RedirectResponse,
+    FileResponse,
+    Response
+)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 
-# Backend application modules
+# Backend modules
 from backend.models import get_pipeline
 from backend.database import get_db
 from backend import crud, schemas
@@ -43,32 +1424,33 @@ from backend.security import (
     create_access_token,
     ACCESS_TOKEN_EXPIRE_MINUTES
 )
-from backend.schemas import UserCreate, UserLogin, Token, UpdateUsername, ChangePassword
-
-# Create Database Tables on Startup
+from backend.schemas import (
+    UserCreate,
+    UserLogin,
+    Token,
+    UpdateUsername,
+    ChangePassword
+)
 from backend.database import engine, Base
 from backend import db_models
+from backend.storage import (
+    upload_content,
+    download_content,
+    upload_audio,
+    get_presigned_audio_url
+)
 
-# Import R2 storage module
-from backend.storage import upload_content, download_content, upload_audio, get_presigned_audio_url
-
+# SQLAlchemy imports
 from sqlalchemy.orm import Session
+from sqlalchemy import inspect as sa_inspect, text as sa_text
+
 from pydantic import BaseModel
 
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
-os.environ["ORT_DISABLE_ALL_EPS_EXCEPT_DEF"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-import warnings
-warnings.filterwarnings("ignore", message="torchcodec is not installed correctly")
-warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 # =====================================================
 # Constants & Configuration
 # =====================================================
 
-# Common stop words to filter out during keyword extraction
 STOP_WORDS = {
     'the', 'a', 'an', 'and', 'but', 'or', 'if', 'then', 'else', 'when',
     'at', 'from', 'by', 'on', 'off', 'for', 'in', 'out', 'over', 'to',
@@ -79,13 +1461,9 @@ STOP_WORDS = {
     'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very',
     's', 't', 'can', 'will', 'just', 'don', 'should', 'now', 'd', 'll',
     'm', 'o', 're', 've', 'y', 'is', 'are', 'was', 'were', 'be', 'been',
-    'being', 'have', 'has', 'had', 'do', 'does', 'did', 'but', 'at', 'by',
-    'with', 'from', 'here', 'when', 'where', 'how', 'all', 'any', 'both',
-    'each', 'few', 'more', 'some', 'such', 'no', 'nor', 'too', 'very',
-    'can', 'will', 'just', 'should', 'now'
+    'being', 'have', 'has', 'had', 'do', 'does', 'did'
 }
 
-# Positive sentiment word list for sentiment analysis
 POSITIVE_WORDS = {
     'good', 'great', 'awesome', 'excellent', 'happy', 'love', 'wonderful',
     'best', 'better', 'success', 'successful', 'win', 'winner', 'gain',
@@ -95,7 +1473,6 @@ POSITIVE_WORDS = {
     'effective', 'productive', 'helpful', 'valuable', 'profitable', 'rewarding'
 }
 
-# Negative sentiment word list for sentiment analysis
 NEGATIVE_WORDS = {
     'bad', 'terrible', 'awful', 'worst', 'worse', 'fail', 'failure',
     'lose', 'loser', 'loss', 'negative', 'problem', 'error', 'issue',
@@ -105,54 +1482,58 @@ NEGATIVE_WORDS = {
     'risky', 'concern', 'worried', 'stress', 'crisis', 'crash', 'broken'
 }
 
-def save_content_file(data: dict) -> str:
-    """
-    Save content data to Cloudflare R2 and return the R2 object key.
-    This keeps large transcription data out of the database for better performance.
-    """
-    key = f"{uuid.uuid4()}.json"
-    r2_key = upload_content(data, key)
-    return r2_key
-
-def read_content_file(r2_key: str) -> dict:
-    """Download and parse content JSON from Cloudflare R2. Returns empty dict on failure."""
-    if not r2_key:
-        return {}
-    return download_content(r2_key)
 
 # =====================================================
 # Content File Management
 # =====================================================
 
-# Request model for translation
+def save_content_file(data: dict) -> str:
+    """Save content data to Cloudflare R2 and return its object key."""
+    key = f"{uuid.uuid4()}.json"
+    r2_key = upload_content(data, key)
+    return r2_key
+
+
+def read_content_file(r2_key: str) -> dict:
+    """Download and parse content JSON from Cloudflare R2."""
+    if not r2_key:
+        return {}
+    return download_content(r2_key)
+
+
+# =====================================================
+# Request Models
+# =====================================================
+
 class TranslateRequest(BaseModel):
     text: str
     source_lang: Optional[str] = "auto"
     target_lang: Optional[str] = "en"
 
-# Request model for language detection
+
 class DetectLanguageRequest(BaseModel):
     text: str
 
-# Configure application logging
+
+# =====================================================
+# Logging Configuration
+# =====================================================
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Store active websocket connections for real-time log streaming
 active_connections: dict[str, WebSocket] = {}
-
-# Queue used to send logs to websockets (async safe)
 log_queue: asyncio.Queue = asyncio.Queue()
-
-# Store main event loop reference for thread-safe log forwarding
 main_loop: asyncio.AbstractEventLoop | None = None
 
-# Custom logging handler that forwards logs to websockets
+
 class WebSocketLogHandler(logging.Handler):
-    """Custom log handler that pushes log messages to all connected WebSocket clients."""
+    """Forward INFO logs to connected WebSocket clients."""
+
     def emit(self, record):
         if record.levelno != logging.INFO or not main_loop:
             return
+
         try:
             msg = self.format(record)
             main_loop.call_soon_threadsafe(
@@ -162,17 +1543,19 @@ class WebSocketLogHandler(logging.Handler):
         except Exception:
             pass
 
-# Register websocket log handler
+
 ws_handler = WebSocketLogHandler()
 ws_handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
 logging.getLogger().addHandler(ws_handler)
 
-# Background task that sends logs to all websocket clients
+
 async def process_log_queue():
-    """Background worker that broadcasts log messages to all connected WebSocket clients."""
+    """Broadcast log messages to connected WebSocket clients."""
+
     while True:
         msg, level = await log_queue.get()
         dead = []
+
         for rid, ws in active_connections.items():
             try:
                 await ws.send_json({
@@ -183,11 +1566,70 @@ async def process_log_queue():
                 })
             except Exception:
                 dead.append(rid)
+
         for rid in dead:
             active_connections.pop(rid, None)
 
 
-# Create FastAPI app
+# =====================================================
+# Database Initialization
+# =====================================================
+
+def _init_db():
+    """Create database tables and apply required migrations."""
+
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database tables created/verified")
+
+    insp = sa_inspect(engine)
+
+    if "files" in insp.get_table_names():
+        existing_cols = {
+            c["name"] for c in insp.get_columns("files")
+        }
+
+        if "duration_seconds" not in existing_cols:
+            with engine.begin() as conn:
+                conn.execute(
+                    sa_text(
+                        "ALTER TABLE files "
+                        "ADD COLUMN duration_seconds FLOAT NULL"
+                    )
+                )
+
+            logger.info("Migrated: added duration_seconds column")
+        else:
+            logger.info("duration_seconds column already exists")
+
+
+# =====================================================
+# Application Lifespan
+# =====================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global main_loop
+
+    main_loop = asyncio.get_running_loop()
+
+    # Initialize database
+    await run_in_threadpool(_init_db)
+
+    # Start WebSocket log processing
+    task = asyncio.create_task(process_log_queue())
+
+    yield
+
+    # Shutdown
+    task.cancel()
+    active_connections.clear()
+
+
+# =====================================================
+# Create FastAPI Application
+# IMPORTANT: This must be AFTER lifespan definition
+# =====================================================
+
 app = FastAPI(
     title="TranscribeFlow",
     version="2.2",
@@ -195,7 +1637,9 @@ app = FastAPI(
 )
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
-ALLOWED_ORIGINS = [FRONTEND_URL] if FRONTEND_URL != "*" else ["*"]
+ALLOWED_ORIGINS = (
+    [FRONTEND_URL] if FRONTEND_URL != "*" else ["*"]
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -205,183 +1649,235 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Resolve base directories
+
+# =====================================================
+# Directory Configuration
+# =====================================================
+
 BASE_DIR = pathlib.Path(__file__).parent.parent.resolve()
+
 UPLOAD_DIR = str(BASE_DIR / "uploads")
 FRONTEND_DIR = str(BASE_DIR / "frontend")
 STATIC_DIR = BASE_DIR / "frontend" / "static"
 
-# File validation settings
-ALLOWED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
-MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB limit
+ALLOWED_EXTENSIONS = {
+    ".mp3", ".wav", ".m4a", ".flac", ".ogg"
+}
 
-def _init_db():
-    """Run DB migrations — called lazily after startup."""
-    Base.metadata.create_all(bind=engine)
-    logger.info("✅ Database tables created/verified")
-    insp = sa_inspect(engine)
-    if "files" in insp.get_table_names():
-        existing_cols = {c["name"] for c in insp.get_columns("files")}
-        if "duration_seconds" not in existing_cols:
-            with engine.begin() as conn:
-                conn.execute(sa_text("ALTER TABLE files ADD COLUMN duration_seconds FLOAT NULL"))
-            logger.info("✅ Migrated: added duration_seconds column")
-        else:
-            logger.info("✅ duration_seconds column already exists")
+MAX_FILE_SIZE = 25 * 1024 * 1024
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global main_loop
-    main_loop = asyncio.get_running_loop()
-    
-    # ← Move all DB setup here (runs AFTER port is bound)
-    await run_in_threadpool(_init_db)
-    
-    task = asyncio.create_task(process_log_queue())
-    yield
-    task.cancel()
-    active_connections.clear()
-    
-# Serve static assets (CSS, JS, images)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+# Serve static assets
+app.mount(
+    "/static",
+    StaticFiles(directory=STATIC_DIR),
+    name="static"
+)
 
-# WebSocket endpoint for live logs
+
+# =====================================================
+# WebSocket Endpoint
+# =====================================================
+
 @app.websocket("/ws/logs/{request_id}")
 async def websocket_logs(ws: WebSocket, request_id: str):
-    """
-    WebSocket endpoint for real-time log streaming.
-    Clients can connect with a request_id to receive processing logs.
-    """
+    """WebSocket endpoint for real-time log streaming."""
+
     await ws.accept()
     active_connections[request_id] = ws
+
     try:
         while True:
             await ws.receive_text()
+
     except WebSocketDisconnect:
         pass
+
     finally:
         active_connections.pop(request_id, None)
+
 
 # =====================================================
 # Authentication Routes
 # =====================================================
 
-@app.post("/api/auth/register", response_model=schemas.UserResponse, status_code=201)
-async def register(user: UserCreate, db: Session = Depends(get_db)):
-    """Register a new user"""
-    
-    # Check if username already exists
+@app.post(
+    "/api/auth/register",
+    response_model=schemas.UserResponse,
+    status_code=201
+)
+async def register(
+    user: UserCreate,
+    db: Session = Depends(get_db)
+):
+    """Register a new user."""
+
     db_user = crud.get_user_by_username(db, user.username)
+
     if db_user:
         raise HTTPException(
             status_code=400,
             detail="Username already registered"
         )
-    
-    # Check if email already exists
+
     db_user = crud.get_user_by_email(db, user.email)
+
     if db_user:
         raise HTTPException(
             status_code=400,
             detail="Email already registered"
         )
-    
-    # Hash password
+
     hashed_password = hash_password(user.password)
-    
-    # Create user
-    new_user = crud.create_user(db, user, hashed_password)
-    
-    logger.info(f"✅ New user registered: {user.username}")
-    
+
+    new_user = crud.create_user(
+        db,
+        user,
+        hashed_password
+    )
+
+    logger.info(f"New user registered: {user.username}")
+
     return new_user
 
+
 @app.post("/api/auth/login", response_model=Token)
-async def login(user_credentials: UserLogin, db: Session = Depends(get_db)):
-    """Login and get access token"""
-    
-    # Authenticate user
-    user = crud.authenticate_user(db, user_credentials.username, user_credentials.password)
-    
+async def login(
+    user_credentials: UserLogin,
+    db: Session = Depends(get_db)
+):
+    """Login and get access token."""
+
+    user = crud.authenticate_user(
+        db,
+        user_credentials.username,
+        user_credentials.password
+    )
+
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    
-    # Create access token
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    access_token_expires = timedelta(
+        minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+    )
+
     access_token = create_access_token(
         data={"sub": user.id},
         expires_delta=access_token_expires
     )
-    
-    logger.info(f"✅ User logged in: {user.username}")
-    
+
+    logger.info(f"User logged in: {user.username}")
+
     return {
         "access_token": access_token,
         "token_type": "bearer"
     }
 
+
 @app.get("/api/auth/me", response_model=schemas.UserResponse)
-async def get_current_user_info(current_user = Depends(get_current_user)):
-    """Get current logged-in user info"""
+async def get_current_user_info(
+    current_user=Depends(get_current_user)
+):
+    """Get current logged-in user info."""
     return current_user
+
 
 @app.post("/api/auth/logout")
 async def logout():
-    """Logout (client should delete token)"""
-    return {"message": "Successfully logged out. Please delete your token."}
+    """Logout. Client should delete its token."""
+    return {
+        "message": "Successfully logged out. Please delete your token."
+    }
+
 
 @app.put("/api/auth/update-username")
 async def update_username(
     payload: UpdateUsername,
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user=Depends(get_current_user)
 ):
-    """Update the current user's username"""
+    """Update the current user's username."""
+
     new_username = payload.new_username.strip()
 
-    # Validate length
     if len(new_username) < 3:
-        raise HTTPException(400, "Username must be at least 3 characters")
+        raise HTTPException(
+            400,
+            "Username must be at least 3 characters"
+        )
 
-    # Check uniqueness
     existing = crud.get_user_by_username(db, new_username)
-    if existing and existing.id != current_user.id:
-        raise HTTPException(400, "Username already taken")
 
-    updated = crud.update_user_username(db, current_user.id, new_username)
+    if existing and existing.id != current_user.id:
+        raise HTTPException(
+            400,
+            "Username already taken"
+        )
+
+    updated = crud.update_user_username(
+        db,
+        current_user.id,
+        new_username
+    )
+
     if not updated:
         raise HTTPException(404, "User not found")
 
-    logger.info(f"✅ Username updated for user {current_user.id}")
-    return {"message": "Username updated successfully", "username": updated.username}
+    logger.info(
+        f"Username updated for user {current_user.id}"
+    )
+
+    return {
+        "message": "Username updated successfully",
+        "username": updated.username
+    }
+
 
 @app.put("/api/auth/change-password")
 async def change_password(
     payload: ChangePassword,
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user=Depends(get_current_user)
 ):
-    """Change the current user's password"""
-    # Verify current password
-    if not verify_password(payload.current_password, current_user.hashed_password):
-        raise HTTPException(400, "Current password is incorrect")
+    """Change the current user's password."""
 
-    # Validate new password length
+    if not verify_password(
+        payload.current_password,
+        current_user.hashed_password
+    ):
+        raise HTTPException(
+            400,
+            "Current password is incorrect"
+        )
+
     if len(payload.new_password) < 6:
-        raise HTTPException(400, "New password must be at least 6 characters")
+        raise HTTPException(
+            400,
+            "New password must be at least 6 characters"
+        )
 
-    # Hash and save
     new_hash = hash_password(payload.new_password)
-    updated = crud.update_user_password(db, current_user.id, new_hash)
+
+    updated = crud.update_user_password(
+        db,
+        current_user.id,
+        new_hash
+    )
+
     if not updated:
         raise HTTPException(404, "User not found")
 
-    logger.info(f"✅ Password changed for user {current_user.id}")
-    return {"message": "Password changed successfully"}
+    logger.info(
+        f"Password changed for user {current_user.id}"
+    )
+
+    return {
+        "message": "Password changed successfully"
+    }
+
 
 # =====================================================
 # File Upload & Processing
@@ -395,141 +1891,197 @@ async def upload_audio(
     enable_diarization: str = Form("false"),
     num_speakers: Optional[int] = Form(None),
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user=Depends(get_current_user),
 ):
     """
-    Upload and process audio file synchronously.
-    Handles file validation, transcription, optional speaker diarization, and summarization.
-    Returns processed content immediately.
+    Upload and process audio synchronously.
+    Handles validation, transcription, optional diarization,
+    and summarization.
     """
+
     ext = os.path.splitext(file.filename)[1].lower()
+
     if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(400, "Unsupported file type")
+        raise HTTPException(
+            400,
+            "Unsupported file type"
+        )
 
     content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(413, "File too large")
 
-    safe_name = f"{uuid.uuid4().hex[:8]}_{file.filename}"
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            413,
+            "File too large"
+        )
+
+    safe_name = (
+        f"{uuid.uuid4().hex[:8]}_{file.filename}"
+    )
 
     # Upload audio to Cloudflare R2
     upload_audio(content, safe_name)
 
-    # Write to /tmp for AI pipeline processing
-    import tempfile
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1])
+    # Write temporary file for AI processing
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=ext
+    )
+
     tmp.write(content)
     tmp.flush()
     tmp.close()
+
     path = tmp.name
 
-    # Parse diarization flag from string
-    diarization_enabled = enable_diarization.lower() in ('true', '1', 'yes', 'on')
-    logger.info(f"🔧 Diarization enabled: {diarization_enabled} (raw value: '{enable_diarization}')")
-
-    # Transcribe
-    transcript_result = await run_in_threadpool(get_pipeline().transcribe, path, language)
-    transcript_text = transcript_result["text"]
-    word_timestamps = transcript_result["words"]
-    transcript_segments = transcript_result.get("segments", [])
-    
-    logger.info(f"📊 Transcription data: {len(word_timestamps)} words, {len(transcript_segments)} segments, {len(transcript_text)} chars")
-    
-    # Speaker diarization (optional)
-    speaker_segments = []
-    formatted_transcript = transcript_text  # Default to plain transcript
-    
-    if diarization_enabled:
-        try:
-            logger.info("🎤 Running speaker diarization...")
-            logger.info(f"📂 Audio file: {path}")
-            logger.info(f"👥 Expected speakers: {num_speakers if num_speakers else 'Auto-detect'}")
-            
-            # Run diarization and wait for completion
-            speaker_segments = await run_in_threadpool(
-                get_pipeline().diarize_speakers,
-                path,
-                num_speakers
-            )
-            
-            # Log what we got back
-            logger.info(f"🔍 Diarization returned {len(speaker_segments) if speaker_segments else 0} segments")
-            
-            # Merge diarization with transcript
-            if speaker_segments and len(speaker_segments) > 0:
-                # Count unique speakers
-                unique_speakers = len(set([s['speaker'] for s in speaker_segments]))
-                logger.info(f"👤 Found {unique_speakers} unique speakers")
-                
-                # Merge with all available transcript data
-                speaker_transcript = get_pipeline().merge_diarization_with_transcript(
-                    word_timestamps,
-                    speaker_segments,
-                    transcript_segments=transcript_segments,
-                    full_text=transcript_text
-                )
-                
-                logger.info(f"📝 Created {len(speaker_transcript)} speaker turns")
-                
-                # Format for display
-                formatted_transcript = get_pipeline().format_transcript_with_speakers(speaker_transcript)
-                
-                logger.info(f"✅ Diarization complete! Transcript formatted with {unique_speakers} speakers")
-            else:
-                logger.warning("⚠️ No speaker segments returned from diarization")
-                logger.warning("⚠️ Using original transcript without speaker labels")
-            
-        except Exception as e:
-            logger.error(f"❌ Diarization failed: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            logger.warning("⚠️ Continuing with original transcript")
-    
-    # Summarize (use the formatted transcript if diarization was used)
-    summary = await run_in_threadpool(get_pipeline().summarize, formatted_transcript, summary_mode)
-    
-    # Create content file data
-    content_data = {
-        "transcript": formatted_transcript,
-        "summary": summary,
-        "word_timestamps": word_timestamps,
-        "speaker_segments": speaker_segments,
-    }
-    
-    # Clean up temp file from /tmp
-    try:
-        if os.path.exists(path):
-            os.remove(path)
-    except Exception:
-        pass
-
-    # Save metadata to database
-    db_file = crud.create_file(
-        db,
-        schemas.FileCreate(
-            user_id=current_user.id,
-            filename=file.filename,
-            saved_as=f"audio/{safe_name}",
-            file_size_mb=round(len(content) / (1024 * 1024), 2),
-            language=language,
-            content_file=content_filename,
-            audio_url=f"/api/stream/{safe_name}",
-        ),
+    diarization_enabled = (
+        enable_diarization.lower()
+        in ("true", "1", "yes", "on")
     )
 
-    return {
-        "id": db_file.id,
-        "filename": file.filename,
-        "file_size": len(content),  # ✅ Add file size in bytes
-        "size": len(content),  # ✅ Add alias
-        "file_size_mb": db_file.file_size_mb,  # ✅ Keep MB version
-        "audio_url": db_file.audio_url,
-        "transcript": formatted_transcript,  # Return from memory since we just created it
-        "summary": summary,
-        "language": language,  # ✅ Add language
-        "created_at": db_file.created_at.isoformat(),  # ✅ Add timestamp
-        "status": "success",
-    }
+    logger.info(
+        f"Diarization enabled: {diarization_enabled}"
+    )
+
+    try:
+        # Transcription
+        transcript_result = await run_in_threadpool(
+            get_pipeline().transcribe,
+            path,
+            language
+        )
+
+        transcript_text = transcript_result["text"]
+        word_timestamps = transcript_result["words"]
+        transcript_segments = transcript_result.get(
+            "segments",
+            []
+        )
+
+        logger.info(
+            f"Transcription data: "
+            f"{len(word_timestamps)} words, "
+            f"{len(transcript_segments)} segments, "
+            f"{len(transcript_text)} characters"
+        )
+
+        # Optional speaker diarization
+        speaker_segments = []
+        formatted_transcript = transcript_text
+
+        if diarization_enabled:
+            try:
+                logger.info("Running speaker diarization...")
+
+                speaker_segments = await run_in_threadpool(
+                    get_pipeline().diarize_speakers,
+                    path,
+                    num_speakers
+                )
+
+                if speaker_segments:
+                    unique_speakers = len(
+                        set(
+                            s["speaker"]
+                            for s in speaker_segments
+                        )
+                    )
+
+                    logger.info(
+                        f"Found {unique_speakers} unique speakers"
+                    )
+
+                    speaker_transcript = (
+                        get_pipeline().merge_diarization_with_transcript(
+                            word_timestamps,
+                            speaker_segments,
+                            transcript_segments=transcript_segments,
+                            full_text=transcript_text
+                        )
+                    )
+
+                    formatted_transcript = (
+                        get_pipeline().format_transcript_with_speakers(
+                            speaker_transcript
+                        )
+                    )
+
+                    logger.info("Diarization completed")
+
+                else:
+                    logger.warning(
+                        "No speaker segments returned"
+                    )
+
+            except Exception as e:
+                logger.error(
+                    f"Diarization failed: {e}",
+                    exc_info=True
+                )
+
+        # Summarization
+        summary = await run_in_threadpool(
+            get_pipeline().summarize,
+            formatted_transcript,
+            summary_mode
+        )
+
+        # Save transcription data to R2
+        content_data = {
+            "transcript": formatted_transcript,
+            "summary": summary,
+            "word_timestamps": word_timestamps,
+            "speaker_segments": speaker_segments,
+        }
+
+        # FIX: Save content and define content_filename
+        content_filename = save_content_file(content_data)
+
+        # Save metadata to database
+        db_file = crud.create_file(
+            db,
+            schemas.FileCreate(
+                user_id=current_user.id,
+                filename=file.filename,
+                saved_as=f"audio/{safe_name}",
+                file_size_mb=round(
+                    len(content) / (1024 * 1024),
+                    2
+                ),
+                language=language,
+                content_file=content_filename,
+                audio_url=f"/api/stream/{safe_name}",
+            ),
+        )
+
+        return {
+            "id": db_file.id,
+            "filename": file.filename,
+            "file_size": len(content),
+            "size": len(content),
+            "file_size_mb": db_file.file_size_mb,
+            "audio_url": db_file.audio_url,
+            "transcript": formatted_transcript,
+            "summary": summary,
+            "language": language,
+            "created_at": db_file.created_at.isoformat(),
+            "status": "success",
+        }
+
+    finally:
+        # Always clean up temporary audio file
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            logger.warning(
+                "Could not remove temporary audio file"
+            )
+
+
+# =====================================================
+# Batch Upload
+# =====================================================
 
 @app.post("/api/upload/batch")
 async def batch_upload_audio(
@@ -540,25 +2092,28 @@ async def batch_upload_audio(
     num_speakers: Optional[int] = Form(None),
     background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user=Depends(get_current_user)
 ):
-    """
-    Upload multiple files and process them in background.
-    Returns immediately with batch ID while processing continues asynchronously.
-    """
-    
+    """Upload multiple files and process them in background."""
+
     if len(files) > 10:
-        raise HTTPException(400, "Maximum 10 files per batch")
-    
+        raise HTTPException(
+            400,
+            "Maximum 10 files per batch"
+        )
+
     batch_id = str(uuid.uuid4())
     results = []
-    
+
     for idx, file in enumerate(files):
         request_id = f"{batch_id}_{idx}"
-        logger.info(f"📤 Batch upload {idx+1}/{len(files)}: {file.filename}")
-        
-        # Validate file
+
+        logger.info(
+            f"Batch upload {idx + 1}/{len(files)}: {file.filename}"
+        )
+
         ext = os.path.splitext(file.filename)[1].lower()
+
         if ext not in ALLOWED_EXTENSIONS:
             results.append({
                 "filename": file.filename,
@@ -566,8 +2121,9 @@ async def batch_upload_audio(
                 "error": "Unsupported file format"
             })
             continue
-        
+
         content = await file.read()
+
         if len(content) > MAX_FILE_SIZE:
             results.append({
                 "filename": file.filename,
@@ -575,24 +2131,31 @@ async def batch_upload_audio(
                 "error": "File too large"
             })
             continue
-        
-        safe_name = f"{uuid.uuid4().hex[:8]}_{file.filename}"
 
-        # Upload audio to Cloudflare R2
+        safe_name = (
+            f"{uuid.uuid4().hex[:8]}_{file.filename}"
+        )
+
         upload_audio(content, safe_name)
 
-        # Write to /tmp for background processing
-        import tempfile
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1])
+        tmp = tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=ext
+        )
+
         tmp.write(content)
         tmp.flush()
         tmp.close()
+
         save_path = tmp.name
-        
-        # Parse diarization flag from string
-        diarization_enabled = enable_diarization.lower() in ('true', '1', 'yes', 'on') if isinstance(enable_diarization, str) else bool(enable_diarization)
-        
-        # Process in background
+
+        diarization_enabled = (
+            enable_diarization.lower()
+            in ("true", "1", "yes", "on")
+            if isinstance(enable_diarization, str)
+            else bool(enable_diarization)
+        )
+
         background_tasks.add_task(
             process_audio_file,
             save_path,
@@ -605,20 +2168,24 @@ async def batch_upload_audio(
             diarization_enabled,
             num_speakers
         )
-        
+
         results.append({
             "filename": file.filename,
             "status": "processing",
             "request_id": request_id
         })
-    
+
     return {
         "batch_id": batch_id,
         "total_files": len(files),
         "results": results
     }
 
-# Background processing function
+
+# =====================================================
+# Background Audio Processing
+# =====================================================
+
 def process_audio_file(
     save_path: str,
     safe_name: str,
@@ -627,95 +2194,134 @@ def process_audio_file(
     summary_mode: str,
     user_id: str,
     file_size: int,
-    enable_diarization = False,
+    enable_diarization=False,
     num_speakers: Optional[int] = None
 ):
-    """
-    Background task to process audio file.
-    Runs transcription, optional diarization, and summarization.
-    Saves results to content file and metadata to database.
-    """
+    """Process audio in the background and save its results."""
+
     from backend.database import SessionLocal
-    
-    # Ensure enable_diarization is a boolean
+
     if isinstance(enable_diarization, str):
-        enable_diarization = enable_diarization.lower() in ('true', '1', 'yes', 'on')
-    
+        enable_diarization = (
+            enable_diarization.lower()
+            in ("true", "1", "yes", "on")
+        )
+
     db = SessionLocal()
+
     try:
-        logger.info(f"🎙️ Processing {filename}...")
-        
-        # Transcribe
-        transcript_result = get_pipeline().transcribe(save_path, language)
+        logger.info(f"Processing {filename}...")
+
+        transcript_result = get_pipeline().transcribe(
+            save_path,
+            language
+        )
+
         transcript_text = transcript_result["text"]
         word_timestamps = transcript_result["words"]
-        transcript_segments = transcript_result.get("segments", [])
-        
-        # Speaker diarization (optional)
+        transcript_segments = transcript_result.get(
+            "segments",
+            []
+        )
+
         speaker_segments = []
         formatted_transcript = transcript_text
-        
+
         if enable_diarization:
             try:
-                speaker_segments = get_pipeline().diarize_speakers(save_path, num_speakers)
-                
-                if speaker_segments:
-                    speaker_transcript = get_pipeline().merge_diarization_with_transcript(
-                        word_timestamps,
-                        speaker_segments,
-                        transcript_segments=transcript_segments,
-                        full_text=transcript_text
+                speaker_segments = (
+                    get_pipeline().diarize_speakers(
+                        save_path,
+                        num_speakers
                     )
-                    formatted_transcript = get_pipeline().format_transcript_with_speakers(speaker_transcript)
-                    
+                )
+
+                if speaker_segments:
+                    speaker_transcript = (
+                        get_pipeline().merge_diarization_with_transcript(
+                            word_timestamps,
+                            speaker_segments,
+                            transcript_segments=transcript_segments,
+                            full_text=transcript_text
+                        )
+                    )
+
+                    formatted_transcript = (
+                        get_pipeline().format_transcript_with_speakers(
+                            speaker_transcript
+                        )
+                    )
+
             except Exception as e:
-                logger.warning(f"⚠️ Diarization failed for {filename}: {e}")
-        
-        # Summarize
-        summary = get_pipeline().summarize(formatted_transcript, summary_mode)
-        
-        # Save to file (NOT DB)
+                logger.warning(
+                    f"Diarization failed for {filename}: {e}"
+                )
+
+        summary = get_pipeline().summarize(
+            formatted_transcript,
+            summary_mode
+        )
+
         content_data = {
             "transcript": formatted_transcript,
             "summary": summary,
             "word_timestamps": word_timestamps,
             "speaker_segments": speaker_segments,
         }
+
         content_filename = save_content_file(content_data)
-        
-        # Calculate audio duration from transcript segments
+
+        # Calculate audio duration
         duration_seconds = None
+
         if transcript_segments:
-            duration_seconds = max(seg.get("end", 0) for seg in transcript_segments)
+            duration_seconds = max(
+                seg.get("end", 0)
+                for seg in transcript_segments
+            )
+
         elif word_timestamps:
-            duration_seconds = max(w.get("end", 0) for w in word_timestamps)
-        
-        # Save to DB
+            duration_seconds = max(
+                word.get("end", 0)
+                for word in word_timestamps
+            )
+
         file_create = schemas.FileCreate(
             user_id=user_id,
             filename=filename,
             saved_as=f"audio/{safe_name}",
-            file_size_mb=round(file_size / (1024 * 1024), 2),
+            file_size_mb=round(
+                file_size / (1024 * 1024),
+                2
+            ),
             language=language,
             content_file=content_filename,
             audio_url=f"/api/stream/{safe_name}",
             duration_seconds=duration_seconds,
         )
-        
-        db_file = crud.create_file(db, file_create)
-        logger.info(f"✅ Completed: {filename}")
-    
+
+        db_file = crud.create_file(
+            db,
+            file_create
+        )
+
+        logger.info(f"Completed: {filename}")
+
     except Exception as e:
-        logger.error(f"❌ Failed {filename}: {e}")
+        logger.error(
+            f"Failed {filename}: {e}",
+            exc_info=True
+        )
 
     finally:
         db.close()
-        # Clean up temp file from /tmp
+
         try:
             if os.path.exists(save_path):
                 os.remove(save_path)
         except Exception:
             pass
+
 
 # =====================================================
 # Audio Streaming
@@ -723,16 +2329,26 @@ def process_audio_file(
 
 @app.get("/api/stream/{filename}")
 async def stream_audio(filename: str, request: Request):
-    """
-    Generate a presigned Cloudflare R2 URL and redirect the client to it.
-    Audio is served directly from Cloudflare CDN - no bandwidth through Render.
-    """
-    from backend.storage import get_presigned_audio_url
+    """Redirect the client to a presigned Cloudflare R2 URL."""
+
     r2_key = f"audio/{filename}"
-    url = get_presigned_audio_url(r2_key, expires_in=3600)
+
+    url = get_presigned_audio_url(
+        r2_key,
+        expires_in=3600
+    )
+
     if not url:
-        raise HTTPException(404, "File not found or storage error")
-    return RedirectResponse(url=url, status_code=302)
+        raise HTTPException(
+            404,
+            "File not found or storage error"
+        )
+
+    return RedirectResponse(
+        url=url,
+        status_code=302
+    )
+
 
 # =====================================================
 # Translation & Language Detection
@@ -740,20 +2356,32 @@ async def stream_audio(filename: str, request: Request):
 
 @app.post("/api/detect-language")
 async def detect_language(req: DetectLanguageRequest):
-    """Detect language of text"""
-    lang = await run_in_threadpool(get_pipeline().detect_language, req.text)
+    """Detect the language of text."""
+
+    lang = await run_in_threadpool(
+        get_pipeline().detect_language,
+        req.text
+    )
+
     return {"language": lang}
+
 
 @app.post("/api/translate")
 async def translate_text(req: TranslateRequest):
-    """Translate text between languages"""
+    """Translate text between languages."""
+
     result = await run_in_threadpool(
         get_pipeline().translate_text,
         req.text,
         req.source_lang,
         req.target_lang,
     )
-    return {"status": "success", **result}
+
+    return {
+        "status": "success",
+        **result
+    }
+
 
 # =====================================================
 # File Management
@@ -766,73 +2394,59 @@ async def get_user_files(
     search: Optional[str] = None,
     include_content: bool = True,
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user=Depends(get_current_user)
 ):
-    """
-    Get all files for the current user with pinned files first.
-    Supports pagination, search, and optional content loading for performance.
-    """
+    """Get files for the current user."""
+
     query = db.query(db_models.File).filter(
         db_models.File.user_id == current_user.id,
         db_models.File.is_deleted == False
     )
-    
+
     if search:
         query = query.filter(
             db_models.File.filename.contains(search)
         )
-    
-    # Sort by pinned first, then by created date
+
     files = query.order_by(
         db_models.File.is_pinned.desc(),
         db_models.File.created_at.desc()
     ).offset(skip).limit(limit).all()
-    
-    total = crud.get_user_file_count(db, current_user.id)
-    
-    # Process files - optimize by skipping content read if not requested
+
+    total = crud.get_user_file_count(
+        db,
+        current_user.id
+    )
+
     result_files = []
-    
-    if include_content:
-        # If including content, read synchronously or defer (simple loop here)
-        for f in files:
-            c_data = read_content_file(f.content_file) if f.content_file else {}
-            result_files.append({
-                "id": f.id,
-                "filename": f.filename,
-                "file_size": int(f.file_size_mb * 1024 * 1024) if f.file_size_mb else 0,
-                "size": int(f.file_size_mb * 1024 * 1024) if f.file_size_mb else 0,
-                "file_size_mb": f.file_size_mb,
-                "size_mb": f.file_size_mb,
-                "language": f.language,
-                "created_at": f.created_at.isoformat(),
-                "audio_url": f.audio_url,
-                "is_starred": f.is_starred,
-                "is_pinned": f.is_pinned,
-                "content_file": f.content_file,
-                "transcript": c_data.get("transcript"),
-                "summary": c_data.get("summary")
-            })
-    else:
-        # Faster path without file I/O
-        for f in files:
-            result_files.append({
-                "id": f.id,
-                "filename": f.filename,
-                "file_size": int(f.file_size_mb * 1024 * 1024) if f.file_size_mb else 0,
-                "size": int(f.file_size_mb * 1024 * 1024) if f.file_size_mb else 0,
-                "file_size_mb": f.file_size_mb,
-                "size_mb": f.file_size_mb,
-                "language": f.language,
-                "created_at": f.created_at.isoformat(),
-                "audio_url": f.audio_url,
-                "is_starred": f.is_starred,
-                "is_pinned": f.is_pinned,
-                "content_file": f.content_file,
-                "transcript": None,
-                "summary": None
-            })
-    
+
+    for f in files:
+        c_data = {}
+
+        if include_content and f.content_file:
+            c_data = read_content_file(f.content_file)
+
+        result_files.append({
+            "id": f.id,
+            "filename": f.filename,
+            "file_size": int(
+                f.file_size_mb * 1024 * 1024
+            ) if f.file_size_mb else 0,
+            "size": int(
+                f.file_size_mb * 1024 * 1024
+            ) if f.file_size_mb else 0,
+            "file_size_mb": f.file_size_mb,
+            "size_mb": f.file_size_mb,
+            "language": f.language,
+            "created_at": f.created_at.isoformat(),
+            "audio_url": f.audio_url,
+            "is_starred": f.is_starred,
+            "is_pinned": f.is_pinned,
+            "content_file": f.content_file,
+            "transcript": c_data.get("transcript"),
+            "summary": c_data.get("summary")
+        })
+
     return {
         "files": result_files,
         "total": total,
@@ -840,14 +2454,19 @@ async def get_user_files(
         "limit": limit
     }
 
+
 @app.get("/api/files/starred")
 async def get_starred_files(
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user=Depends(get_current_user)
 ):
-    """Get all starred files"""
-    files = crud.get_starred_files(db, current_user.id)
-    
+    """Get all starred files."""
+
+    files = crud.get_starred_files(
+        db,
+        current_user.id
+    )
+
     return {
         "files": [
             {
@@ -861,34 +2480,54 @@ async def get_starred_files(
         ]
     }
 
+
 @app.get("/api/files/{file_id}")
 async def get_file(
     file_id: str,
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user=Depends(get_current_user)
 ):
-    """Get a single file by ID with all associated content"""
-    file = crud.get_file_by_id(db, file_id, current_user.id)
-    
+    """Get one file with all associated content."""
+
+    file = crud.get_file_by_id(
+        db,
+        file_id,
+        current_user.id
+    )
+
     if not file:
-        raise HTTPException(404, "File not found")
-    
-    # Calculate file size in bytes from MB
-    file_size_bytes = int(file.file_size_mb * 1024 * 1024) if file.file_size_mb else 0
-    
-    # Read content from file
+        raise HTTPException(
+            404,
+            "File not found"
+        )
+
+    file_size_bytes = int(
+        file.file_size_mb * 1024 * 1024
+    ) if file.file_size_mb else 0
+
     transcript = None
     summary = None
     word_timestamps = None
     speaker_segments = None
-    
+
     if file.content_file:
         content = read_content_file(file.content_file)
+
         transcript = content.get("transcript")
         summary = content.get("summary")
-        word_timestamps = json.dumps(content.get("word_timestamps")) if content.get("word_timestamps") else None
-        speaker_segments = json.dumps(content.get("speaker_segments")) if content.get("speaker_segments") else None
-    
+
+        word_timestamps = (
+            json.dumps(content.get("word_timestamps"))
+            if content.get("word_timestamps")
+            else None
+        )
+
+        speaker_segments = (
+            json.dumps(content.get("speaker_segments"))
+            if content.get("speaker_segments")
+            else None
+        )
+
     return {
         "id": file.id,
         "filename": file.filename,
@@ -908,55 +2547,91 @@ async def get_file(
         "content_file": file.content_file
     }
 
+
 @app.delete("/api/files/{file_id}")
 async def delete_file(
     file_id: str,
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user=Depends(get_current_user)
 ):
-    """Delete a file (soft delete)"""
-    success = crud.delete_file(db, file_id, current_user.id)
-    
+    """Soft-delete a file."""
+
+    success = crud.delete_file(
+        db,
+        file_id,
+        current_user.id
+    )
+
     if not success:
-        raise HTTPException(404, "File not found")
-    
-    return {"message": "File deleted successfully"}
+        raise HTTPException(
+            404,
+            "File not found"
+        )
+
+    return {
+        "message": "File deleted successfully"
+    }
+
 
 @app.patch("/api/files/{file_id}/star")
 async def star_file(
     file_id: str,
     request: Request,
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user=Depends(get_current_user)
 ):
-    """Star/unstar a file"""
+    """Star or unstar a file."""
+
     body = await request.json()
-    starred = body.get('starred', False)
-    
-    success = crud.star_file(db, file_id, current_user.id, starred)
-    
+    starred = body.get("starred", False)
+
+    success = crud.star_file(
+        db,
+        file_id,
+        current_user.id,
+        starred
+    )
+
     if not success:
-        raise HTTPException(404, "File not found")
-    
-    return {"message": "File starred" if starred else "File unstarred"}
+        raise HTTPException(
+            404,
+            "File not found"
+        )
+
+    return {
+        "message": "File starred" if starred else "File unstarred"
+    }
+
 
 @app.patch("/api/files/{file_id}/pin")
 async def pin_file(
     file_id: str,
     request: Request,
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user=Depends(get_current_user)
 ):
-    """Pin/unpin a file"""
+    """Pin or unpin a file."""
+
     body = await request.json()
-    pinned = body.get('pinned', False)
-    
-    success = crud.pin_file(db, file_id, current_user.id, pinned)
-    
+    pinned = body.get("pinned", False)
+
+    success = crud.pin_file(
+        db,
+        file_id,
+        current_user.id,
+        pinned
+    )
+
     if not success:
-        raise HTTPException(404, "File not found")
-    
-    return {"message": "File pinned" if pinned else "File unpinned"}
+        raise HTTPException(
+            404,
+            "File not found"
+        )
+
+    return {
+        "message": "File pinned" if pinned else "File unpinned"
+    }
+
 
 # =====================================================
 # Export
@@ -965,73 +2640,126 @@ async def pin_file(
 @app.get("/api/files/{file_id}/export")
 async def export_file(
     file_id: str,
-    format: str,  # txt, pdf, docx, or srt
-    content: str = "both",  # transcript, summary, or both
+    format: str,
+    content: str = "both",
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user=Depends(get_current_user)
 ):
-    """
-    Export transcript in various formats.
-    Supports TXT, PDF, DOCX, and SRT with options to export transcript, summary, or both.
-    """
-    file = crud.get_file_by_id(db, file_id, current_user.id)
-    
+    """Export transcript and summary as TXT, PDF, DOCX, or SRT."""
+
+    file = crud.get_file_by_id(
+        db,
+        file_id,
+        current_user.id
+    )
+
     if not file:
-        raise HTTPException(404, "File not found")
-    
+        raise HTTPException(
+            404,
+            "File not found"
+        )
+
     format = format.lower()
     content = content.lower()
-    
-    # Determine what text to export based on content param
-    # Load content from file
+
     transcript_text = ""
     summary_text = ""
     word_timestamps_data = None
-    
+
     if file.content_file:
-        content_data = read_content_file(file.content_file)
-        transcript_text = content_data.get("transcript") or ""
-        summary_text = content_data.get("summary") or ""
-        word_timestamps_data = content_data.get("word_timestamps") # List or None
+        content_data = read_content_file(
+            file.content_file
+        )
+
+        transcript_text = (
+            content_data.get("transcript") or ""
+        )
+
+        summary_text = (
+            content_data.get("summary") or ""
+        )
+
+        word_timestamps_data = content_data.get(
+            "word_timestamps"
+        )
 
     if content == "transcript":
-        # transcript_text already populated
         summary_text = ""
+
     elif content == "summary":
         transcript_text = ""
-        # summary_text already populated
-    else:  # both
-        # both already populated
-        pass
-    
+
     if format == "txt":
-        export_content = export_txt(transcript_text, summary_text, file.filename, content)
+        export_content = export_txt(
+            transcript_text,
+            summary_text,
+            file.filename,
+            content
+        )
+
         media_type = "text/plain"
         extension = "txt"
+
     elif format == "pdf":
-        export_content = export_pdf(transcript_text, summary_text, file.filename, content)
+        export_content = export_pdf(
+            transcript_text,
+            summary_text,
+            file.filename,
+            content
+        )
+
         media_type = "application/pdf"
         extension = "pdf"
+
     elif format == "docx":
-        export_content = export_docx(transcript_text, summary_text, file.filename, content)
-        media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        export_content = export_docx(
+            transcript_text,
+            summary_text,
+            file.filename,
+            content
+        )
+
+        media_type = (
+            "application/vnd.openxmlformats-officedocument."
+            "wordprocessingml.document"
+        )
+
         extension = "docx"
+
     elif format == "srt":
-        # Prepare word_timestamps as JSON string/list for export_srt
-        wt_input = json.dumps(word_timestamps_data) if word_timestamps_data else "[]"
-        export_content = export_srt(wt_input, transcript_text)
+        wt_input = (
+            json.dumps(word_timestamps_data)
+            if word_timestamps_data
+            else "[]"
+        )
+
+        export_content = export_srt(
+            wt_input,
+            transcript_text
+        )
+
         media_type = "application/x-subrip"
         extension = "srt"
+
     else:
-        raise HTTPException(400, "Invalid format. Use: txt, pdf, docx, or srt")
-    
-    filename = f"{file.filename.rsplit('.', 1)[0]}.{extension}"
-    
+        raise HTTPException(
+            400,
+            "Invalid format. Use: txt, pdf, docx, or srt"
+        )
+
+    filename = (
+        f"{file.filename.rsplit('.', 1)[0]}.{extension}"
+    )
+
     return StreamingResponse(
         BytesIO(export_content),
         media_type=media_type,
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        headers={
+            "Content-Disposition":
+                f"attachment; filename={filename}"
+        }
     )
+
 
 # =====================================================
 # Health Check
@@ -1039,14 +2767,18 @@ async def export_file(
 
 @app.get("/api/health")
 async def health():
-    """Health check endpoint"""
-    return {"status": "ok", "version": "2.2"}
+    """Health check endpoint."""
+
+    return {
+        "status": "ok",
+        "version": "2.2"
+    }
+
 
 # =====================================================
 # Dashboard Stats
 # =====================================================
 
-# Stop words to exclude from keyword extraction
 STOP_WORDS = {
     'the','a','an','and','or','but','in','on','at','to','for','of','with',
     'by','from','is','it','this','that','was','are','were','be','been',
@@ -1064,8 +2796,8 @@ STOP_WORDS = {
     'find','tell','ask','work','seem','feel','try','leave','call','need',
     'become','keep','put','mean','still','back','turn','long','right',
     'going','really','even','way','good','yeah','okay','yes','um','uh',
-    'oh','ah','speaker','would','going','actually','something','people',
-    'time','first','last','next','much','little'
+    'oh','ah','speaker','actually','something','people','time','first',
+    'last','next','little'
 }
 
 POSITIVE_WORDS = {
@@ -1086,24 +2818,23 @@ NEGATIVE_WORDS = {
     'lack','lacking','unable','cannot','complaint','slow','expensive',
 }
 
+
 @app.get("/api/dashboard/stats")
 def get_dashboard_stats(
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user=Depends(get_current_user)
 ):
     """
-    Get dashboard statistics for the current user.
-    Calculates usage metrics, trends, common keywords, sentiment analysis,
-    and productivity score based on transcription activity.
+    Calculate dashboard statistics, trends, keywords,
+    sentiment, and productivity score.
     """
-    from sqlalchemy import func as sqlfunc
+
     from collections import Counter
     import re
 
     user_id = current_user.id
 
     try:
-        # ── Base query: all non-deleted files for this user ──────────
         base = db.query(db_models.File).filter(
             db_models.File.user_id == user_id,
             db_models.File.is_deleted == False
@@ -1125,144 +2856,261 @@ def get_dashboard_stats(
                 "minutes_trend_pct": 0,
                 "quota_pct": 0,
                 "common_keywords": [],
-                "sentiment": {"positive": 0, "neutral": 0, "negative": 0},
+                "sentiment": {
+                    "positive": 0,
+                    "neutral": 0,
+                    "negative": 0
+                },
                 "productivity_score": 0,
             }
 
-        # ── Backfill duration_seconds for files that don't have it ────
+        # Backfill duration for older files
         for f in all_files:
             if f.duration_seconds is None and f.content_file:
                 try:
                     c_data = read_content_file(f.content_file)
                     segments = c_data.get("word_timestamps") or []
+
                     if segments:
-                        max_end = max(seg.get("end", 0) for seg in segments)
+                        max_end = max(
+                            seg.get("end", 0)
+                            for seg in segments
+                        )
+
                         if max_end > 0:
                             f.duration_seconds = max_end
                             db.add(f)
+
                 except Exception:
                     pass
+
         try:
             db.commit()
         except Exception:
             db.rollback()
 
-        # ── Basic aggregates ─────────────────────────────────────────
-        total_storage_mb = sum(f.file_size_mb or 0 for f in all_files)
-
-        total_seconds = sum(
-            f.duration_seconds if f.duration_seconds else (f.file_size_mb or 0) * 60
+        total_storage_mb = sum(
+            f.file_size_mb or 0
             for f in all_files
         )
-        total_minutes = round(total_seconds / 60, 1)
-        avg_duration_min = round(total_minutes / total_files, 1) if total_files else 0
 
-        lang_counts = Counter(f.language for f in all_files if f.language)
-        most_used_language = lang_counts.most_common(1)[0][0] if lang_counts else "—"
+        total_seconds = sum(
+            f.duration_seconds
+            if f.duration_seconds
+            else (f.file_size_mb or 0) * 60
+            for f in all_files
+        )
 
-        # ── Weekly stats (last 7 days vs prior 7 days) ───────────────
+        total_minutes = round(
+            total_seconds / 60,
+            1
+        )
+
+        avg_duration_min = round(
+            total_minutes / total_files,
+            1
+        ) if total_files else 0
+
+        lang_counts = Counter(
+            f.language
+            for f in all_files
+            if f.language
+        )
+
+        most_used_language = (
+            lang_counts.most_common(1)[0][0]
+            if lang_counts
+            else "—"
+        )
+
+        # Weekly statistics
         now = datetime.utcnow()
         week_ago = now - timedelta(days=7)
         two_weeks_ago = now - timedelta(days=14)
 
         this_week = []
+        last_week = []
+
         for f in all_files:
             try:
-                if f.created_at:
-                    ca = f.created_at.replace(tzinfo=None) if f.created_at.tzinfo else f.created_at
-                    if ca >= week_ago:
-                        this_week.append(f)
+                if not f.created_at:
+                    continue
+
+                created_at = (
+                    f.created_at.replace(tzinfo=None)
+                    if f.created_at.tzinfo
+                    else f.created_at
+                )
+
+                if created_at >= week_ago:
+                    this_week.append(f)
+
+                elif two_weeks_ago <= created_at < week_ago:
+                    last_week.append(f)
+
             except Exception:
                 pass
-            
-            last_week = [f for f in all_files if f.created_at and two_weeks_ago <= f.created_at.replace(tzinfo=None) < week_ago]
 
         weekly_files = len(this_week)
+
         weekly_seconds = sum(
-            f.duration_seconds if f.duration_seconds else (f.file_size_mb or 0) * 60
+            f.duration_seconds
+            if f.duration_seconds
+            else (f.file_size_mb or 0) * 60
             for f in this_week
         )
-        weekly_minutes = round(weekly_seconds / 60, 1)
+
+        weekly_minutes = round(
+            weekly_seconds / 60,
+            1
+        )
 
         last_week_files = len(last_week)
+
         last_week_seconds = sum(
-            f.duration_seconds if f.duration_seconds else (f.file_size_mb or 0) * 60
+            f.duration_seconds
+            if f.duration_seconds
+            else (f.file_size_mb or 0) * 60
             for f in last_week
         )
 
         files_trend_pct = 0
+
         if last_week_files > 0:
-            files_trend_pct = round(((weekly_files - last_week_files) / last_week_files) * 100)
+            files_trend_pct = round(
+                (
+                    (weekly_files - last_week_files)
+                    / last_week_files
+                ) * 100
+            )
+
         elif weekly_files > 0:
             files_trend_pct = 100
 
         minutes_trend_pct = 0
+
         if last_week_seconds > 0:
-            minutes_trend_pct = round(((weekly_seconds - last_week_seconds) / last_week_seconds) * 100)
+            minutes_trend_pct = round(
+                (
+                    (weekly_seconds - last_week_seconds)
+                    / last_week_seconds
+                ) * 100
+            )
+
         elif weekly_seconds > 0:
             minutes_trend_pct = 100
 
-        quota_pct = min(round((weekly_files / max(total_files, 1)) * 100), 100)
+        quota_pct = min(
+            round(
+                (weekly_files / max(total_files, 1)) * 100
+            ),
+            100
+        )
 
-        # ── Common keywords from recent transcripts ──────────────────
-        recent_files = sorted(all_files, key=lambda f: f.created_at or datetime.min, reverse=True)[:20]
+        # Common keywords
+        recent_files = sorted(
+            all_files,
+            key=lambda f: f.created_at or datetime.min,
+            reverse=True
+        )[:20]
+
         word_counter = Counter()
+
         for f in recent_files:
             f_transcript = None
+
             if f.content_file:
                 try:
                     c_data = read_content_file(f.content_file)
                     f_transcript = c_data.get("transcript")
                 except Exception:
                     pass
+
             if f_transcript:
-                words = re.findall(r'[a-zA-Z]{3,}', f_transcript.lower())
-                word_counter.update(w for w in words if w not in STOP_WORDS)
+                words = re.findall(
+                    r'[a-zA-Z]{3,}',
+                    f_transcript.lower()
+                )
 
-        common_keywords = [word.title() for word, _ in word_counter.most_common(8)]
+                word_counter.update(
+                    w for w in words
+                    if w not in STOP_WORDS
+                )
 
-        # ── Sentiment heuristic ──────────────────────────────────────
+        common_keywords = [
+            word.title()
+            for word, _ in word_counter.most_common(8)
+        ]
+
+        # Sentiment heuristic
         pos_count = 0
         neg_count = 0
         total_sentiment_words = 0
+
         for f in recent_files:
             f_transcript = None
+
             if f.content_file:
                 try:
                     c_data = read_content_file(f.content_file)
                     f_transcript = c_data.get("transcript")
                 except Exception:
                     pass
+
             if f_transcript:
-                words = re.findall(r'[a-zA-Z]{3,}', f_transcript.lower())
+                words = re.findall(
+                    r'[a-zA-Z]{3,}',
+                    f_transcript.lower()
+                )
+
                 for w in words:
                     if w in POSITIVE_WORDS:
                         pos_count += 1
                         total_sentiment_words += 1
+
                     elif w in NEGATIVE_WORDS:
                         neg_count += 1
                         total_sentiment_words += 1
 
         if total_sentiment_words > 0:
-            pos_pct = round((pos_count / total_sentiment_words) * 100)
-            neg_pct = round((neg_count / total_sentiment_words) * 100)
+            pos_pct = round(
+                (pos_count / total_sentiment_words) * 100
+            )
+
+            neg_pct = round(
+                (neg_count / total_sentiment_words) * 100
+            )
+
             neu_pct = 100 - pos_pct - neg_pct
+
         else:
             pos_pct, neu_pct, neg_pct = 0, 0, 0
 
-        # ── Productivity score (60/40 weighted average) ──────────────
-        WEEKLY_FILE_TARGET = 10   # target files per week
-        WEEKLY_DAY_TARGET  = 7    # target active days per week
+        # Productivity score
+        WEEKLY_FILE_TARGET = 10
+        WEEKLY_DAY_TARGET = 7
 
         active_days = set()
+
         for f in this_week:
             if f.created_at:
-                active_days.add(f.created_at.replace(tzinfo=None).date())
+                active_days.add(
+                    f.created_at.replace(tzinfo=None).date()
+                )
 
-        file_score = min((weekly_files / WEEKLY_FILE_TARGET) * 100, 100)   # 60% weight
-        day_score  = min((len(active_days) / WEEKLY_DAY_TARGET) * 100, 100) # 40% weight
+        file_score = min(
+            (weekly_files / WEEKLY_FILE_TARGET) * 100,
+            100
+        )
 
-        productivity_score = round(0.6 * file_score + 0.4 * day_score)
+        day_score = min(
+            (len(active_days) / WEEKLY_DAY_TARGET) * 100,
+            100
+        )
+
+        productivity_score = round(
+            0.6 * file_score + 0.4 * day_score
+        )
 
         return {
             "total_files": total_files,
@@ -1285,7 +3133,11 @@ def get_dashboard_stats(
         }
 
     except Exception as e:
-        logger.error(f"❌ Dashboard stats error: {e}", exc_info=True)
+        logger.error(
+            f"Dashboard stats error: {e}",
+            exc_info=True
+        )
+
         return {
             "total_files": 0,
             "total_minutes": 0,
@@ -1298,66 +3150,124 @@ def get_dashboard_stats(
             "minutes_trend_pct": 0,
             "quota_pct": 0,
             "common_keywords": [],
-            "sentiment": {"positive": 34, "neutral": 33, "negative": 33},
+            "sentiment": {
+                "positive": 34,
+                "neutral": 33,
+                "negative": 33
+            },
             "productivity_score": 0,
         }
 
 
+# =====================================================
+# Favicon
+# =====================================================
+
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
-    path = "static/favicon.ico"
+    path = str(STATIC_DIR / "favicon.ico")
+
     if os.path.exists(path):
         return FileResponse(path)
+
     return Response(status_code=204)
 
+
 # =====================================================
-# Frontend Routes (No Auth Check)
+# Frontend Routes
 # =====================================================
 
 @app.get("/")
 async def serve_index():
-    """Serve landing page"""
-    file_path = os.path.join(FRONTEND_DIR, "index.html")
+    """Serve landing page."""
+
+    file_path = os.path.join(
+        FRONTEND_DIR,
+        "index.html"
+    )
+
     return FileResponse(file_path)
+
 
 @app.get("/login")
 async def serve_login():
-    """Serve login page"""
-    file_path = os.path.join(FRONTEND_DIR, "login.html")
+    """Serve login page."""
+
+    file_path = os.path.join(
+        FRONTEND_DIR,
+        "login.html"
+    )
+
     return FileResponse(file_path)
+
 
 @app.get("/register")
 async def serve_register():
-    """Serve registration page"""
-    file_path = os.path.join(FRONTEND_DIR, "register.html")
+    """Serve registration page."""
+
+    file_path = os.path.join(
+        FRONTEND_DIR,
+        "register.html"
+    )
+
     return FileResponse(file_path)
+
 
 @app.get("/upload")
 async def serve_upload():
-    """Serve upload page"""
-    file_path = os.path.join(FRONTEND_DIR, "upload.html")
+    """Serve upload page."""
+
+    file_path = os.path.join(
+        FRONTEND_DIR,
+        "upload.html"
+    )
+
     return FileResponse(file_path)
+
 
 @app.get("/dashboard")
 async def serve_dashboard():
-    """Serve dashboard page"""
-    file_path = os.path.join(FRONTEND_DIR, "dashboard.html")
+    """Serve dashboard page."""
+
+    file_path = os.path.join(
+        FRONTEND_DIR,
+        "dashboard.html"
+    )
+
     return FileResponse(file_path)
+
 
 @app.get("/results")
 async def serve_results():
-    """Serve results page"""
-    file_path = os.path.join(FRONTEND_DIR, "results.html")
+    """Serve results page."""
+
+    file_path = os.path.join(
+        FRONTEND_DIR,
+        "results.html"
+    )
+
     return FileResponse(file_path)
+
 
 @app.get("/history")
 async def serve_history():
-    """Serve history (file manager) page"""
-    file_path = os.path.join(FRONTEND_DIR, "history.html")
+    """Serve history page."""
+
+    file_path = os.path.join(
+        FRONTEND_DIR,
+        "history.html"
+    )
+
     return FileResponse(file_path)
+
 
 @app.get("/user")
 async def serve_user():
-    """Serve user profile page"""
-    file_path = os.path.join(FRONTEND_DIR, "user.html")
+    """Serve user profile page."""
+
+    file_path = os.path.join(
+        FRONTEND_DIR,
+        "user.html"
+    )
+
     return FileResponse(file_path)

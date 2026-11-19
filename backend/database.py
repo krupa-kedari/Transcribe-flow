@@ -12,12 +12,17 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
+connect_args = {"application_name": "transcribeflow"}
+
+# CockroachDB cloud connections require SSL, while a local PostgreSQL server
+# normally does not.  Only force SSL for the CockroachDB URLs documented in
+# the project (or when it is explicitly requested in the URL).
+if "cockroachlabs.cloud" in DATABASE_URL or "sslmode=require" in DATABASE_URL:
+    connect_args["sslmode"] = "require"
+
 engine = create_engine(
     DATABASE_URL,
-    connect_args={
-        "sslmode": "require",
-        "application_name": "transcribeflow",
-    },
+    connect_args=connect_args,
     pool_pre_ping=True,
     pool_recycle=300,
     echo=False,
